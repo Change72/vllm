@@ -1,0 +1,382 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Remote G2 OffloadingSpec.
+
+Subclass of ``CPUOffloadingSpec`` that:
+
+* Reuses the inherited host pool (pinned CPU tensors) + GPU<->CPU
+  handlers.
+* Swaps the manager for ``RemoteG2OffloadingManager``.
+* Brings up the source-side bits at first ``get_handlers`` call:
+  - Extracts the host pool base pointer from the inherited handlers
+    and sets the pool layout on the manager.
+  - Builds a NIXL source agent over the pool (or a mock when NIXL is
+    unavailable) and registers a bundle provider so peers can fetch
+    metadata via ``SourceG2RpcServer.get_metadata``.
+  - Spawns the ZMQ REP server bound to the trtllm-compatible socket
+    path so the dynamo source bridge can forward to us unchanged.
+* Brings up the target-side bits in parallel:
+  - Builds a NIXL target adapter over the local GPU pool.
+  - Registers a ``RemoteG2TransferHandler`` for the
+    ``(RemoteG2LoadSpec, GPULoadStoreSpec)`` direction.
+  - Installs a ``TargetClientFactory`` on the manager that, given a
+    plan, returns a ``TargetG2RpcClient`` pointed at the source.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from collections.abc import Iterator
+from typing import Any
+
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCaches,
+    GPULoadStoreSpec,
+    LoadStoreSpec,
+    OffloadingManager,
+)
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.remote_g2.data_model import RemoteKvReusePlan
+from vllm.v1.kv_offload.remote_g2.load_spec import RemoteG2LoadSpec
+from vllm.v1.kv_offload.remote_g2.manager import RemoteG2OffloadingManager
+from vllm.v1.kv_offload.remote_g2.nixl_adapter import (
+    NixlSourceBundle,
+    RawNixlRemoteG2Adapter,
+    build_source_agent,
+)
+from vllm.v1.kv_offload.remote_g2.source_rpc import (
+    SourceG2RpcServer,
+    default_socket_path,
+)
+from vllm.v1.kv_offload.remote_g2.target_client import TargetG2RpcClient
+from vllm.v1.kv_offload.remote_g2.transfer_handler import (
+    RemoteG2TransferHandler,
+)
+from vllm.v1.kv_offload.worker.worker import OffloadingHandler
+
+logger = init_logger(__name__)
+
+
+def _resolve_int(extra: dict, key: str, env: str, default: int) -> int:
+    if key in extra:
+        return int(extra[key])
+    raw = os.environ.get(env)
+    return int(raw) if raw is not None else default
+
+
+def _resolve_str(extra: dict, key: str, env: str, default: str) -> str:
+    if key in extra:
+        return str(extra[key])
+    return os.environ.get(env, default)
+
+
+def _resolve_bool(extra: dict, key: str, env: str, default: bool) -> bool:
+    if key in extra:
+        return bool(extra[key])
+    raw = os.environ.get(env)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class RemoteG2OffloadingSpec(CPUOffloadingSpec):
+    """CPUOffloadingSpec + Remote G2 (KV-P2P) capabilities.
+
+    ``kv_connector_extra_config`` keys (env-fallback in parentheses):
+
+    * ``cpu_bytes_to_use`` — inherited; required.
+    * ``source_worker_id`` (env ``REMOTE_G2_SOURCE_WORKER_ID``) — required.
+    * ``source_dp_rank`` (env ``REMOTE_G2_SOURCE_DP_RANK``) — default 0.
+    * ``source_rpc_socket_path`` (env ``REMOTE_G2_SOURCE_RPC_SOCKET_PATH``)
+      — defaults to ``/tmp/dynamo_remote_g2_ipc_<dynamo_pid>.sock``.
+    * ``peer_endpoints`` — JSON-style ``"<worker_id>=<socket_path>,..."``
+      mapping a peer source worker id to its REP socket. Consulted when
+      the manager resolves a plan with that ``source_worker_id``. May be
+      empty if dynamo will inject endpoints at runtime via
+      ``set_peer_endpoint``.
+    * ``use_mock_nixl`` (env ``REMOTE_G2_USE_MOCK_NIXL``) — force the
+      bytes-memcpy transport even when ``nixl`` is installed (for tests).
+    * ``lease_ttl_ms`` — default 30_000.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
+        super().__init__(vllm_config, kv_cache_config)
+
+        extra = self.extra_config
+        self.source_worker_id = _resolve_int(
+            extra, "source_worker_id", "REMOTE_G2_SOURCE_WORKER_ID", -1
+        )
+        if self.source_worker_id < 0:
+            raise ValueError(
+                "RemoteG2OffloadingSpec requires source_worker_id "
+                "(kv_connector_extra_config or REMOTE_G2_SOURCE_WORKER_ID)"
+            )
+        self.source_dp_rank = _resolve_int(
+            extra, "source_dp_rank", "REMOTE_G2_SOURCE_DP_RANK", 0
+        )
+        self.lease_ttl_ms = _resolve_int(
+            extra, "lease_ttl_ms", "REMOTE_G2_LEASE_TTL_MS", 30_000
+        )
+        self.source_rpc_socket_path = _resolve_str(
+            extra,
+            "source_rpc_socket_path",
+            "REMOTE_G2_SOURCE_RPC_SOCKET_PATH",
+            default_socket_path(),
+        )
+        self.use_mock_nixl = _resolve_bool(
+            extra, "use_mock_nixl", "REMOTE_G2_USE_MOCK_NIXL", False
+        )
+        self.enable_source_rpc: bool = bool(
+            extra.get("enable_source_rpc", True)
+        )
+
+        # peer_worker_id -> source rpc socket path. Populated either
+        # from extra_config or via set_peer_endpoint() at runtime.
+        self._peer_endpoints: dict[int, str] = {}
+        for pair in str(extra.get("peer_endpoints", "")).split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            wid, path = pair.split("=", 1)
+            try:
+                self._peer_endpoints[int(wid.strip())] = path.strip()
+            except ValueError:
+                continue
+
+        self._rpc_server: SourceG2RpcServer | None = None
+        self._source_bundle: NixlSourceBundle | None = None
+        self._target_adapter: RawNixlRemoteG2Adapter | None = None
+        self._transfer_handler: RemoteG2TransferHandler | None = None
+        self._target_clients: dict[int, TargetG2RpcClient] = {}
+        self._clients_lock = threading.Lock()
+
+    # --- public helpers ---
+
+    def set_peer_endpoint(self, worker_id: int, socket_path: str) -> None:
+        self._peer_endpoints[int(worker_id)] = str(socket_path)
+
+    def get_manager(self) -> OffloadingManager:
+        if self._manager is None:
+            kv_events_config = self.vllm_config.kv_events_config
+            enable_events = (
+                kv_events_config is not None
+                and kv_events_config.enable_kv_cache_events
+            )
+            store_threshold = int(self.extra_config.get("store_threshold", 0))
+            max_tracker_size = int(
+                self.extra_config.get("max_tracker_size", 64_000)
+            )
+            mgr = RemoteG2OffloadingManager(
+                num_blocks=self.num_blocks,
+                source_worker_id=self.source_worker_id,
+                source_dp_rank=self.source_dp_rank,
+                cache_policy=self.eviction_policy,  # type: ignore[arg-type]
+                enable_events=enable_events,
+                store_threshold=store_threshold,
+                max_tracker_size=max_tracker_size,
+                lease_ttl_ms=self.lease_ttl_ms,
+            )
+            mgr.set_target_client_factory(self._build_target_client)
+            self._manager = mgr
+        return self._manager
+
+    def get_handlers(
+        self, kv_caches: CanonicalKVCaches
+    ) -> Iterator[
+        tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]
+    ]:
+        manager = self.get_manager()
+        assert isinstance(manager, RemoteG2OffloadingManager)
+
+        # Materialise the inherited handlers so cpu_tensors gets built.
+        yielded_cpu_gpu = False
+        for entry in super().get_handlers(kv_caches):
+            yield entry
+            yielded_cpu_gpu = True
+
+        if not yielded_cpu_gpu:
+            return
+
+        assert self._handlers is not None
+        cpu_tensors = self._handlers.gpu_to_cpu_handler.dst_tensors
+        if not cpu_tensors:
+            logger.warning(
+                "RemoteG2OffloadingSpec: no CPU tensors materialised; "
+                "skipping NIXL agent setup. Multi-tensor models need M4."
+            )
+            return
+
+        cpu_tensor = cpu_tensors[0]
+        page_size_bytes = int(cpu_tensor.shape[-1])
+        num_cpu_blocks = int(cpu_tensor.shape[0])
+        total_bytes = page_size_bytes * num_cpu_blocks
+        host_pool_base = int(cpu_tensor.data_ptr())
+
+        # Push pool layout to manager so descriptors carry correct
+        # byte_offset + nixl_memory_desc.ptr from now on.
+        manager.set_pool_layout(
+            pool_base_ptr=host_pool_base,
+            page_size_bytes=page_size_bytes,
+            rank=0,
+            num_workers=1,
+        )
+
+        # Source NIXL agent (or mock).
+        agent_name = f"remote-g2-src-{self.source_worker_id}"
+        bundle = build_source_agent(
+            agent_name,
+            host_pool_base,
+            total_bytes,
+            source_generation=1,
+            backends=() if self.use_mock_nixl else ("UCX",),
+        )
+        self._source_bundle = bundle
+        if bundle is None:
+            logger.warning(
+                "RemoteG2OffloadingSpec: source NIXL bundle unavailable; "
+                "peers cannot fetch metadata via get_metadata until M4 "
+                "retries this path."
+            )
+
+        # ZMQ REP server (binds the engine-side socket).
+        if self.enable_source_rpc and self._rpc_server is None:
+            self._rpc_server = SourceG2RpcServer(
+                manager.registry,
+                socket_path=self.source_rpc_socket_path,
+                manager=manager,
+            )
+            if bundle is not None:
+                self._rpc_server.set_nixl_bundle_provider(lambda b=bundle: b)
+            self._rpc_server.start()
+            logger.info(
+                "RemoteG2OffloadingSpec source RPC at ipc://%s "
+                "(source_worker_id=%d)",
+                self.source_rpc_socket_path,
+                self.source_worker_id,
+            )
+
+        # Target-side adapter. Uses the local GPU pool tensors as the
+        # transfer destination. Single-tensor POC.
+        gpu_tensor_blob = kv_caches.tensors[0]
+        gpu_base = int(gpu_tensor_blob.tensor.data_ptr())
+        gpu_total = int(
+            gpu_tensor_blob.tensor.numel() * gpu_tensor_blob.tensor.element_size()
+        )
+        target_agent_name = f"remote-g2-tgt-{self.source_worker_id}"
+        try:
+            self._target_adapter = RawNixlRemoteG2Adapter(
+                target_agent_name,
+                gpu_base,
+                gpu_total,
+                backends=("UCX",),
+                use_mock=self.use_mock_nixl,
+            )
+        except Exception:
+            logger.exception(
+                "RemoteG2OffloadingSpec: target adapter setup failed; "
+                "remote loads will be unavailable until adapter recovers"
+            )
+            self._target_adapter = None
+
+        if self._target_adapter is not None:
+            self._transfer_handler = RemoteG2TransferHandler(
+                adapter=self._target_adapter,
+                gpu_page_size_bytes=gpu_tensor_blob.page_size_bytes,
+                ensure_peer=self._ensure_peer,
+                on_load_done=self._on_load_done,
+            )
+            yield (RemoteG2LoadSpec, GPULoadStoreSpec, self._transfer_handler)
+
+    def shutdown(self) -> None:
+        if self._rpc_server is not None:
+            self._rpc_server.stop()
+            self._rpc_server = None
+        with self._clients_lock:
+            for client in self._target_clients.values():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            self._target_clients.clear()
+
+    # --- target side wiring ---
+
+    def _build_target_client(
+        self, plan: RemoteKvReusePlan
+    ) -> TargetG2RpcClient | None:
+        sock = self._peer_endpoints.get(int(plan.source_worker_id))
+        if not sock:
+            logger.warning(
+                "RemoteG2: no peer endpoint registered for worker_id=%d; "
+                "configure kv_connector_extra_config.peer_endpoints or "
+                "call set_peer_endpoint() at boot",
+                plan.source_worker_id,
+            )
+            return None
+        with self._clients_lock:
+            client = self._target_clients.get(plan.source_worker_id)
+            if client is None:
+                client = TargetG2RpcClient(sock)
+                self._target_clients[plan.source_worker_id] = client
+        return client
+
+    def _ensure_peer(self, peer_name: str) -> bool:
+        """Look up or perform the NIXL metadata handshake with a peer.
+
+        Returns True once ``add_peer`` has been called (or already was).
+        """
+        if self._target_adapter is None:
+            return False
+        # peer_name format from manager.prepare_load:
+        # f"{plan.source_tier}:{plan.source_worker_id}"
+        try:
+            _, worker_id_str = peer_name.split(":", 1)
+            worker_id = int(worker_id_str)
+        except ValueError:
+            logger.warning("RemoteG2: bad peer_name %r", peer_name)
+            return False
+        client = None
+        with self._clients_lock:
+            client = self._target_clients.get(worker_id)
+        if client is None:
+            sock = self._peer_endpoints.get(worker_id)
+            if sock is None:
+                return False
+            client = TargetG2RpcClient(sock)
+            with self._clients_lock:
+                self._target_clients.setdefault(worker_id, client)
+                client = self._target_clients[worker_id]
+        try:
+            bundle = client.get_metadata(
+                peer_agent_metadata=self._target_adapter.agent_metadata
+            )
+        except Exception:
+            logger.exception("RemoteG2: get_metadata RPC failed for %s", peer_name)
+            return False
+        if bundle is None:
+            return False
+        try:
+            self._target_adapter.add_peer(
+                peer_name,
+                peer_agent_metadata=bundle.get("agent_metadata", b""),
+                peer_pool_base_ptr=int(bundle.get("pool_base_ptr", 0)),
+                peer_pool_size_bytes=int(bundle.get("pool_size_bytes", 0)),
+            )
+            return True
+        except Exception:
+            logger.exception("RemoteG2: add_peer failed for %s", peer_name)
+            return False
+
+    def _on_load_done(self, lease_id: str) -> None:
+        # Best-effort release. The plan-driven lookup cache also calls
+        # release on request finish; one of the two paths will land.
+        for client in list(self._target_clients.values()):
+            try:
+                if client.release_lease(lease_id, reason="load_done"):
+                    return
+            except Exception:
+                continue

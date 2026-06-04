@@ -1,0 +1,561 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Data model for Remote G2 KV-P2P.
+
+Mirrors the TRT-LLM types in ``tensorrt_llm/_torch/pyexecutor/connectors/
+remote_g2.py`` (RemoteKvReusePlan, SourceG2DescriptorRecord,
+SourceG2DescriptorRegistry, RemoteG2Descriptor, RemoteG2ResolveResult)
+with vLLM-specific simplifications:
+
+* Single ``threading.RLock`` index instead of TRT-LLM's two-index
+  (engine C++ lookup tree + Python registry) design. CPUOffloadingManager
+  is pure-Python with O(1) lookup, so a single RLock suffices.
+* Plan hashes are kept as Router-native ``int`` (XXH3-64) on the wire and
+  converted at the boundary where the vLLM ``OffloadKey`` (bytes) index
+  is queried.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+REMOTE_KV_REUSE_PLAN_VERSION = 1
+REMOTE_G2_TIERS = frozenset({"host_pinned", "g2"})
+
+
+def _now_ms() -> int:
+    # Wall-clock millis (not monotonic) so plan.expires_at_ms (from the
+    # Router) and our lease TTLs share the same time base across processes.
+    return int(time.time() * 1000)
+
+
+def _is_remote_g2_tier(tier: str) -> bool:
+    return tier in REMOTE_G2_TIERS
+
+
+@dataclass(frozen=True)
+class RemoteKvReusePlan:
+    """Plan produced by Dynamo Router and delivered to the target worker
+    via ``kv_transfer_params["remote_g2_plan"]``.
+
+    Fields mirror the TRT-LLM ``RemoteKvReusePlan`` exactly so a single
+    Router code path serves both engines. ``kv_block_hashes`` is empty
+    when the producer hasn't been updated to populate the engine-side
+    hash; in that case ``block_hashes`` is used for the source lookup.
+    """
+
+    plan_id: str
+    request_id: str
+    target_worker_id: int
+    target_dp_rank: int
+    source_worker_id: int
+    source_dp_rank: int
+    source_tier: str
+    block_hashes: tuple[int, ...]
+    start_block_index: int
+    planned_prefix_blocks: int
+    block_size_tokens: int
+    created_at_ms: int
+    expires_at_ms: int
+    plan_version: int = REMOTE_KV_REUSE_PLAN_VERSION
+    kv_block_hashes: tuple[int, ...] = ()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> RemoteKvReusePlan:
+        required = (
+            "plan_id",
+            "request_id",
+            "target_worker_id",
+            "target_dp_rank",
+            "source_worker_id",
+            "source_dp_rank",
+            "source_tier",
+            "start_block_index",
+            "block_hashes",
+            "planned_prefix_blocks",
+            "block_size_tokens",
+            "created_at_ms",
+            "expires_at_ms",
+        )
+        missing = [f for f in required if f not in data]
+        if missing:
+            raise ValueError(f"remote G2 plan missing fields: {missing}")
+
+        block_hashes = tuple(int(h) for h in data["block_hashes"])
+        kv_block_hashes = tuple(int(h) for h in data.get("kv_block_hashes", ()))
+        if kv_block_hashes and len(kv_block_hashes) != len(block_hashes):
+            raise ValueError(
+                "kv_block_hashes length must match block_hashes when provided"
+            )
+        planned_prefix_blocks = int(data["planned_prefix_blocks"])
+        if planned_prefix_blocks < 0:
+            raise ValueError("planned_prefix_blocks must be non-negative")
+        start_block_index = int(data["start_block_index"])
+        if start_block_index < 0:
+            raise ValueError("start_block_index must be non-negative")
+
+        return cls(
+            plan_id=str(data["plan_id"]),
+            request_id=str(data["request_id"]),
+            target_worker_id=int(data["target_worker_id"]),
+            target_dp_rank=int(data["target_dp_rank"]),
+            source_worker_id=int(data["source_worker_id"]),
+            source_dp_rank=int(data["source_dp_rank"]),
+            source_tier=str(data["source_tier"]),
+            block_hashes=block_hashes,
+            kv_block_hashes=kv_block_hashes,
+            start_block_index=start_block_index,
+            planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
+            block_size_tokens=int(data["block_size_tokens"]),
+            created_at_ms=int(data["created_at_ms"]),
+            expires_at_ms=int(data["expires_at_ms"]),
+            plan_version=int(
+                data.get("plan_version", REMOTE_KV_REUSE_PLAN_VERSION)
+            ),
+        )
+
+    def is_remote_g2(self) -> bool:
+        return _is_remote_g2_tier(self.source_tier)
+
+    def is_expired(self, now_ms: int | None = None) -> bool:
+        return self.expires_at_ms <= (now_ms if now_ms is not None else _now_ms())
+
+    @property
+    def planned_hashes(self) -> tuple[int, ...]:
+        return self.block_hashes[: self.planned_prefix_blocks]
+
+    @property
+    def planned_kv_block_hashes(self) -> tuple[int, ...]:
+        return self.kv_block_hashes[: self.planned_prefix_blocks]
+
+
+@dataclass(frozen=True)
+class RemoteG2Descriptor:
+    """Source-resolved descriptor returned to the target worker."""
+
+    block_hash: int
+    descriptor_generation: int
+    pool_id: str
+    byte_offset: int
+    byte_length: int
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RemoteG2BlockStatus:
+    block_hash: int
+    status: str
+    descriptor_generation: int | None = None
+
+
+@dataclass(frozen=True)
+class RemoteG2ResolveResult:
+    lease_id: str | None
+    descriptors: tuple[RemoteG2Descriptor, ...]
+    num_tokens: int
+    reason: str = "ok"
+    source_generation: int = 0
+    per_block_status: tuple[RemoteG2BlockStatus, ...] = ()
+
+
+@dataclass
+class RemoteG2Lease:
+    lease_id: str
+    plan_id: str
+    request_id: str
+    target_worker_id: int
+    target_dp_rank: int
+    block_hashes: tuple[int, ...]
+    descriptor_generations: tuple[int, ...]
+    expires_at_ms: int
+    pin_refs: tuple[Any, ...] = ()
+    released: bool = False
+    release_reason: str | None = None
+
+
+@dataclass
+class SourceG2DescriptorRecord:
+    """Live host-pool block descriptor on the source side.
+
+    ``byte_offset`` is the offset into the contiguous mmap host pool
+    (see ``SharedOffloadRegion``). ``metadata['nixl_memory_desc']``
+    carries the NIXL descriptor (ptr/size/device_id/memory_type).
+    """
+
+    block_hash: int
+    source_worker_id: int
+    source_dp_rank: int
+    tier: str
+    descriptor_generation: int
+    pool_id: str
+    byte_offset: int
+    byte_length: int
+    block_id: int = -1
+    live: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+    lease_count: int = 0
+
+    def is_resolvable_for(self, source_worker_id: int, source_dp_rank: int) -> bool:
+        return (
+            self.live
+            and self.source_worker_id == source_worker_id
+            and self.source_dp_rank == source_dp_rank
+            and _is_remote_g2_tier(self.tier)
+        )
+
+
+class SourceG2DescriptorRegistry:
+    """Source-worker owned live host-pool descriptor + lease registry.
+
+    Single-index design (a ``dict[block_hash_int, record]``) guarded by a
+    ``threading.RLock``. Hit path: ``resolve_and_lease`` is O(N_plan) with
+    only hashmap lookups under the lock.
+
+    The registry also stashes the host-pool layout (base ptr, page size,
+    rank, row stride, tier, pool_id, device_id) so the manager (which
+    runs scheduler-side) and the RPC server (worker-side) — which in
+    vLLM v1 sit on *different* Spec instances within the same EngineCore
+    process — share the same view. Use ``get_or_create()`` to obtain the
+    process-wide registry for a given ``(source_worker_id,
+    source_dp_rank)``.
+    """
+
+    # Process-wide cache so the scheduler-side and worker-side Specs
+    # share state. Keyed by (source_worker_id, source_dp_rank).
+    _instances: dict[tuple[int, int], SourceG2DescriptorRegistry] = {}
+    _instances_lock = threading.Lock()
+
+    def __init__(
+        self,
+        *,
+        source_worker_id: int,
+        source_dp_rank: int,
+        source_generation: int = 1,
+        lease_ttl_ms: int = 30_000,
+        clock_ms: Callable[[], int] = _now_ms,
+        acquire_pin: Callable[[SourceG2DescriptorRecord, str], Any] | None = None,
+        release_pin: Callable[[Any], None] | None = None,
+    ) -> None:
+        self.source_worker_id = int(source_worker_id)
+        self.source_dp_rank = int(source_dp_rank)
+        self.source_generation = int(source_generation)
+        self.lease_ttl_ms = int(lease_ttl_ms)
+        self._clock_ms = clock_ms
+        self._acquire_pin = acquire_pin
+        self._release_pin = release_pin
+        self._records: dict[int, SourceG2DescriptorRecord] = {}
+        self._leases: dict[str, RemoteG2Lease] = {}
+        self._lock = threading.RLock()
+
+        # Pool layout — set by the worker-side spec after KV caches are
+        # registered. Until then, descriptor publish path is gated.
+        self._pool_base_ptr: int = 0
+        self._page_size_bytes: int = 0
+        self._row_stride_bytes: int = 0
+        self._rank: int = 0
+        self._tier: str = "host_pinned"
+        self._pool_id: str = "g2-host-pinned"
+        self._device_id: int = 0
+        self._descriptor_generation_counter: dict[int, int] = {}
+
+        # Target-side counters (incremented by manager when this engine
+        # acts as a *target* and the plan-driven path fires). Exposed via
+        # SourceG2RpcServer.stats so tests can verify cross-engine flow.
+        self.plan_seen_count: int = 0
+        self.plan_resolved_count: int = 0
+        self.plan_load_specs_emitted: int = 0
+        self.plan_blocks_loaded: int = 0
+
+    @classmethod
+    def get_or_create(
+        cls,
+        source_worker_id: int,
+        source_dp_rank: int,
+        **kwargs: Any,
+    ) -> SourceG2DescriptorRegistry:
+        """Return the process-wide registry for ``(source_worker_id,
+        source_dp_rank)``, creating it if necessary.
+
+        The first call constructs the registry with the passed kwargs;
+        subsequent calls return the same instance regardless of kwargs
+        (so the second-Spec-instance code path doesn't reset state).
+        """
+        key = (int(source_worker_id), int(source_dp_rank))
+        with cls._instances_lock:
+            inst = cls._instances.get(key)
+            if inst is None:
+                inst = cls(
+                    source_worker_id=source_worker_id,
+                    source_dp_rank=source_dp_rank,
+                    **kwargs,
+                )
+                cls._instances[key] = inst
+        return inst
+
+    @classmethod
+    def _clear_singletons_for_tests(cls) -> None:
+        """Drop all cached registries. Used by unit tests; not safe to
+        call while production specs are alive."""
+        with cls._instances_lock:
+            cls._instances.clear()
+
+    # --- pool layout (set by worker-side spec) ---
+
+    def set_pool_layout(
+        self,
+        *,
+        pool_base_ptr: int,
+        page_size_bytes: int,
+        rank: int = 0,
+        num_workers: int = 1,
+        row_stride_bytes: int | None = None,
+        tier: str = "host_pinned",
+        pool_id: str = "g2-host-pinned",
+        device_id: int = 0,
+    ) -> None:
+        if page_size_bytes <= 0:
+            raise ValueError("page_size_bytes must be positive")
+        if pool_base_ptr <= 0:
+            raise ValueError("pool_base_ptr must be non-zero")
+        with self._lock:
+            self._pool_base_ptr = int(pool_base_ptr)
+            self._page_size_bytes = int(page_size_bytes)
+            self._rank = int(rank)
+            self._row_stride_bytes = int(
+                row_stride_bytes
+                if row_stride_bytes is not None
+                else page_size_bytes * max(num_workers, 1)
+            )
+            self._tier = str(tier)
+            self._pool_id = str(pool_id)
+            self._device_id = int(device_id)
+
+    def pool_layout_ready(self) -> bool:
+        return self._pool_base_ptr > 0 and self._page_size_bytes > 0
+
+    def upsert_for_block(
+        self, block_hash_int: int, block_id: int
+    ) -> SourceG2DescriptorRecord | None:
+        """Build and store a descriptor for ``(block_hash, block_id)``.
+
+        Returns the record (so callers can log) or ``None`` if the pool
+        layout has not been set yet (descriptor publish is gated).
+        """
+        with self._lock:
+            if not self.pool_layout_ready():
+                return None
+            byte_offset = (
+                block_id * self._row_stride_bytes
+                + self._rank * self._page_size_bytes
+            )
+            gen = self._descriptor_generation_counter.get(block_hash_int, 0) + 1
+            self._descriptor_generation_counter[block_hash_int] = gen
+            record = SourceG2DescriptorRecord(
+                block_hash=block_hash_int,
+                source_worker_id=self.source_worker_id,
+                source_dp_rank=self.source_dp_rank,
+                tier=self._tier,
+                descriptor_generation=gen,
+                pool_id=self._pool_id,
+                byte_offset=byte_offset,
+                byte_length=self._page_size_bytes,
+                block_id=block_id,
+                metadata={
+                    "nixl_memory_desc": {
+                        "ptr": self._pool_base_ptr + byte_offset,
+                        "size": self._page_size_bytes,
+                        "device_id": self._device_id,
+                        "memory_type": "DRAM",
+                        "name": self._pool_id,
+                    }
+                },
+            )
+            self._records[block_hash_int] = record
+        return record
+
+    def upsert_descriptor(self, record: SourceG2DescriptorRecord) -> None:
+        if record.source_worker_id != self.source_worker_id:
+            raise ValueError("record source_worker_id does not match registry")
+        if record.source_dp_rank != self.source_dp_rank:
+            raise ValueError("record source_dp_rank does not match registry")
+        if not _is_remote_g2_tier(record.tier):
+            raise ValueError("registry accepts remote G2 records only")
+        with self._lock:
+            self._records[int(record.block_hash)] = record
+
+    def remove_descriptor(self, block_hash: int) -> None:
+        with self._lock:
+            record = self._records.pop(int(block_hash), None)
+            if record is not None:
+                record.live = False
+
+    def get_descriptor(
+        self, block_hash: int
+    ) -> SourceG2DescriptorRecord | None:
+        with self._lock:
+            return self._records.get(int(block_hash))
+
+    def _new_lease_id(self, plan_id: str, request_id: str) -> str:
+        return f"{plan_id}:{request_id}:{self._clock_ms()}"
+
+    def resolve_and_lease(
+        self, plan: Mapping[str, Any] | RemoteKvReusePlan
+    ) -> RemoteG2ResolveResult:
+        """Resolve a plan against the registry and grant a lease.
+
+        Returns descriptors for the maximal prefix of the plan that is
+        currently live, plus a lease id holding ``acquire_pin`` references
+        so concurrent eviction is suppressed for the lease window.
+        """
+        now_ms = self._clock_ms()
+        try:
+            parsed = (
+                plan
+                if isinstance(plan, RemoteKvReusePlan)
+                else RemoteKvReusePlan.from_dict(plan)
+            )
+        except (TypeError, ValueError):
+            return RemoteG2ResolveResult(
+                None, (), 0, "invalid_plan", self.source_generation
+            )
+        if parsed.plan_version != REMOTE_KV_REUSE_PLAN_VERSION:
+            return RemoteG2ResolveResult(
+                None, (), 0, "unsupported_plan_version", self.source_generation
+            )
+        if parsed.source_worker_id != self.source_worker_id:
+            return RemoteG2ResolveResult(
+                None, (), 0, "wrong_source_worker", self.source_generation
+            )
+        if parsed.source_dp_rank != self.source_dp_rank:
+            return RemoteG2ResolveResult(
+                None, (), 0, "wrong_source_rank", self.source_generation
+            )
+        if not parsed.is_remote_g2():
+            return RemoteG2ResolveResult(
+                None, (), 0, "wrong_source_tier", self.source_generation
+            )
+        if parsed.is_expired(now_ms):
+            return RemoteG2ResolveResult(
+                None, (), 0, "plan_expired", self.source_generation
+            )
+
+        identity_hashes = parsed.planned_hashes
+        kv_hashes = parsed.planned_kv_block_hashes or identity_hashes
+        lease_id = self._new_lease_id(parsed.plan_id, parsed.request_id)
+
+        descriptors: list[RemoteG2Descriptor] = []
+        per_block_status: list[RemoteG2BlockStatus] = []
+        pin_refs: list[Any] = []
+
+        with self._lock:
+            for i, identity_hash in enumerate(identity_hashes):
+                kv_hash = int(kv_hashes[i])
+                record = self._records.get(kv_hash)
+                if record is None or not record.live:
+                    reason = "missing" if record is None else "non_live"
+                    per_block_status.append(
+                        RemoteG2BlockStatus(int(identity_hash), reason)
+                    )
+                    break
+                if not record.is_resolvable_for(
+                    self.source_worker_id, self.source_dp_rank
+                ):
+                    per_block_status.append(
+                        RemoteG2BlockStatus(int(identity_hash), "wrong_owner")
+                    )
+                    break
+                pin_ref: Any = None
+                if self._acquire_pin is not None:
+                    try:
+                        pin_ref = self._acquire_pin(record, lease_id)
+                    except Exception:
+                        per_block_status.append(
+                            RemoteG2BlockStatus(int(identity_hash), "pin_failed")
+                        )
+                        break
+                record.lease_count += 1
+                pin_refs.append(pin_ref)
+                descriptors.append(
+                    RemoteG2Descriptor(
+                        block_hash=int(identity_hash),
+                        descriptor_generation=record.descriptor_generation,
+                        pool_id=record.pool_id,
+                        byte_offset=record.byte_offset,
+                        byte_length=record.byte_length,
+                        metadata=dict(record.metadata),
+                    )
+                )
+                per_block_status.append(
+                    RemoteG2BlockStatus(
+                        int(identity_hash),
+                        "resolved",
+                        descriptor_generation=record.descriptor_generation,
+                    )
+                )
+
+            if not descriptors:
+                return RemoteG2ResolveResult(
+                    None,
+                    (),
+                    0,
+                    per_block_status[0].status if per_block_status else "empty",
+                    self.source_generation,
+                    tuple(per_block_status),
+                )
+
+            lease = RemoteG2Lease(
+                lease_id=lease_id,
+                plan_id=parsed.plan_id,
+                request_id=parsed.request_id,
+                target_worker_id=parsed.target_worker_id,
+                target_dp_rank=parsed.target_dp_rank,
+                block_hashes=tuple(d.block_hash for d in descriptors),
+                descriptor_generations=tuple(
+                    d.descriptor_generation for d in descriptors
+                ),
+                expires_at_ms=now_ms + self.lease_ttl_ms,
+                pin_refs=tuple(pin_refs),
+            )
+            self._leases[lease_id] = lease
+
+        return RemoteG2ResolveResult(
+            lease_id=lease_id,
+            descriptors=tuple(descriptors),
+            num_tokens=len(descriptors) * parsed.block_size_tokens,
+            reason="ok",
+            source_generation=self.source_generation,
+            per_block_status=tuple(per_block_status),
+        )
+
+    def release_lease(self, lease_id: str, reason: str = "released") -> bool:
+        with self._lock:
+            lease = self._leases.pop(lease_id, None)
+            if lease is None or lease.released:
+                return False
+            lease.released = True
+            lease.release_reason = reason
+            for block_hash, pin_ref in zip(lease.block_hashes, lease.pin_refs):
+                record = self._records.get(int(block_hash))
+                if record is not None and record.lease_count > 0:
+                    record.lease_count -= 1
+                if self._release_pin is not None:
+                    try:
+                        self._release_pin(pin_ref)
+                    except Exception:
+                        pass
+            return True
+
+    def expire_stale_leases(self, now_ms: int | None = None) -> int:
+        ts = now_ms if now_ms is not None else self._clock_ms()
+        expired: list[str] = []
+        with self._lock:
+            for lease_id, lease in self._leases.items():
+                if not lease.released and lease.expires_at_ms <= ts:
+                    expired.append(lease_id)
+        for lease_id in expired:
+            self.release_lease(lease_id, reason="ttl_expired")
+        return len(expired)
