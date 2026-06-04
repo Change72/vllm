@@ -1,0 +1,101 @@
+{
+  "num_prompts": 16,
+  "prompt_repeat": 60,
+  "source_descriptor_count": 910,
+  "plan_hash_count": 910,
+  "source_reference_ms": 777.2369496524334,
+  "cycles": {
+    "baseline_0_7": {
+      "indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "generate_ms": 2097.9951694607735,
+      "ms_per_prompt": 262.2493961825967,
+      "delta_stats": {
+        "plan_seen_count": 0,
+        "plan_resolved_count": 0,
+        "plan_load_specs_emitted": 0,
+        "plan_blocks_loaded": 0
+      },
+      "texts": [
+        " The history of the Roman Empire spans more than a thousand years",
+        " Photosynthesis is the elegant biochemical process by which plants and certain",
+        " Modern Python programming embraces idioms such as list comprehensions,",
+        "\u4e1c\u4eac\u7684\u7e41\u534e\u8857\u533a\u878d\u5408\u4e86\u8d85\u73b0\u4ee3\u7684\u6469\u5929\u5927\u697c",
+        " Quantum mechanics introduces the strange notion that particles exist in superposition",
+        " The Great Barrier Reef harbors an astonishing diversity of marine life",
+        " \u8bf7\u5e2e\u6211\u5206\u6790\u4e00\u4e0b\u8fd9\u6bb5\u6587\u5b57\u7684\u91cd\u590d\u7387\u548c\u91cd\u590d",
+        " Climate change driven by human greenhouse gas emissions threatens to destabilize"
+      ]
+    },
+    "plan_driven_cold_8_15": {
+      "indices": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "generate_ms": 878.7531405687332,
+      "ms_per_prompt": 109.84414257109165,
+      "delta_stats": {
+        "plan_seen_count": 8,
+        "plan_resolved_count": 8,
+        "plan_load_specs_emitted": 7,
+        "plan_blocks_loaded": 910
+      },
+      "texts": [
+        "\u8bf7\u5c06\u4ee5\u4e0a\u5185\u5bb9\u8fdb\u884c\u53bb\u91cd\uff0c\u53ea\u4fdd\u7559\u4e00\u4e2a\u53e5\u5b50",
+        " 2  2  2  2 ",
+        " 2  2  2       ",
+        "    \n  \n  \n  \n  \n  \n  \n  \n  \n  \n",
+        " 88888888888",
+        "                      ",
+        "  computing computing computing computing computing computing computing computing computing computing computing",
+        " 2  2  2  ffffffffffffffff"
+      ]
+    },
+    "baseline_hot_8_15": {
+      "indices": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "generate_ms": 394.5985734462738,
+      "ms_per_prompt": 49.324821680784225,
+      "delta_stats": {
+        "plan_seen_count": 0,
+        "plan_resolved_count": 0,
+        "plan_load_specs_emitted": 0,
+        "plan_blocks_loaded": 0
+      },
+      "texts": [
+        "\u8bf7\u5c06\u4e0a\u8ff0\u5185\u5bb9\u8fdb\u884c\u53bb\u91cd\uff0c\u53ea\u4fdd\u7559\u4e00\u4e2a\u53e5\u5b50",
+        " 2  2  2  2 ",
+        " 2  2  2  2 ",
+        "    \n  \n  \n  \n  \n  \n  \n  \n  \n  \n",
+        " 88888888888",
+        "                      ",
+        "  computing computing computing computing computing computing computing computing computing computing computing",
+        " 2  2  2  ffffffffffffffff"
+      ]
+    }
+  },
+  "per_prompt_match": 8,
+  "per_prompt_total": 24
+}
