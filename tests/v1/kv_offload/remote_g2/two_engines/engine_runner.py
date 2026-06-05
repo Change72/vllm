@@ -119,27 +119,41 @@ def main() -> int:
     sampling = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
 
     if args.mode == "source":
+        # Warmup with the FULL prompt set so the host pool fills with
+        # entries for every prompt (the registry needs hashes from
+        # prompts 0..N-1 so target plan-driven loads can resolve).
         for r in range(args.source_warmup_rounds):
             t0 = time.perf_counter()
             llm.generate(prompts, sampling, use_tqdm=False)
             print(
-                f"[runner source] warmup round {r} "
+                f"[runner source] warmup round {r} (all 16 prompts) "
                 f"{(time.perf_counter() - t0) * 1000:.0f} ms",
                 flush=True,
             )
+        # Reference pass — match the target's batch composition so the
+        # source / target output comparison is apples-to-apples
+        # (vLLM v1's async + chunked-prefill scheduling makes the
+        # first generated token under temperature=0 depend on the
+        # batch contents; running 8-at-a-time on source mirrors what
+        # the target does per cycle).
+        half = len(prompts) // 2
         t0 = time.perf_counter()
-        reference = llm.generate(prompts, sampling, use_tqdm=False)
+        out_first = llm.generate(prompts[:half], sampling, use_tqdm=False)
+        out_second = llm.generate(prompts[half:], sampling, use_tqdm=False)
         ref_ms = (time.perf_counter() - t0) * 1000
+        reference_texts = (
+            [o.outputs[0].text for o in out_first]
+            + [o.outputs[0].text for o in out_second]
+        )
         _write_status(
             status_dir,
             "source_outputs.json",
-            {
-                "texts": [o.outputs[0].text for o in reference],
-                "generate_ms": ref_ms,
-            },
+            {"texts": reference_texts, "generate_ms": ref_ms},
         )
         print(
-            f"[runner source] reference pass {ref_ms:.0f} ms; idling", flush=True
+            f"[runner source] reference (2x{half}-prompt batches) "
+            f"{ref_ms:.0f} ms; idling",
+            flush=True,
         )
         _write_status(status_dir, "source_ready", "ok")
         while not (status_dir / "stop").exists():

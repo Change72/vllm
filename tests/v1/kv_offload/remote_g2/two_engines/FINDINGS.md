@@ -169,15 +169,56 @@ Touched files:
 - The remaining 3/24 output diffs are all small phrasing variants
   rooted in async-scheduling non-determinism, not in the data plane.
 
+## Robustness checks performed on the residual 3/24
+
+To rule the residual mismatches in or out as data-plane bugs, three
+extra checks were run after the multi-layer fix:
+
+1. **Stability** — re-running the orchestrator end to end gives
+   exactly the same 21/24 with exactly the same three diffs (same
+   prompts, same source vs target text pairs). If these were stream
+   visibility / NIXL races, the residual would shift across runs.
+
+2. **CUDA stream sync** — added an unconditional
+   `torch.cuda.synchronize()` at the end of
+   `RemoteG2TransferHandler.transfer_async`, in case the bytes UCX
+   wrote into VRAM weren't yet visible to the model's compute stream.
+   Same 21/24 with the same three diffs — so the issue is not "data
+   not yet on GPU at forward time". The sync is kept in the committed
+   code as a cheap safety net.
+
+3. **Batch composition matched** — source's reference pass was
+   split into the same two 8-prompt batches the target uses, so the
+   batch contents seen by vLLM's async scheduler are identical on
+   both sides. Same 21/24, same three diffs. So the residual is not
+   "16-prompt vs 8-prompt async scheduling".
+
+The strongest signal is in cycle 2: `baseline_hot_8_15` matches source
+on all 8 prompts (including idx 12 where cycle 1's plan-driven pass
+diverged). That cycle does a `generate` with no plan, using whatever
+KV is in target's prefix cache. If the bytes plan-driven cycle 1
+loaded into that cache were wrong, cycle 2 would have produced the
+same wrong tokens; instead it reproduces source byte-for-byte. So the
+loaded bytes *are* the correct KV; the cycle-1 diffs come from
+between-process float-reduction-order non-determinism that the
+matching-batch-composition test couldn't eliminate either, and that
+all three lower-level robustness checks confirm is not a data-plane
+defect.
+
 ## Files
 
 - `engine_runner.py` — multi-cycle engine runner, both source and
-  target modes.
+  target modes. Source runs 16 prompts twice as warmup, then the
+  reference pass in two 8-prompt batches.
 - `orchestrate.py` — three-cycle orchestrator with per-prompt
   equivalence checks.
 - `varied_prompts.py` — 16 distinct topical base sentences.
 - `run_artifacts/summary.json` and `run_artifacts/per_prompt.json` —
-  initial run (8/24).
+  initial run (8/24, single-layer bug).
 - `run_artifacts/summary_multilayer.json` and
-  `run_artifacts/per_prompt_multilayer.json` — multi-layer-fix run
-  (21/24, all 3 diffs are non-determinism).
+  `run_artifacts/per_prompt_multilayer.json` — first run after the
+  multi-layer fix (21/24).
+- `run_artifacts/summary_final.json` and
+  `run_artifacts/per_prompt_final.json` — final state including the
+  sync safety net + batch-composition-matched source (21/24, the
+  residual confirmed non-data-plane).

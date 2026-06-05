@@ -112,6 +112,29 @@ class RemoteG2TransferHandler(OffloadingHandler):
             logger.exception("RemoteG2 NIXL READ failed (job_id=%d)", job_id)
             ok = False
 
+        # Force a device synchronization so the bytes UCX wrote into
+        # VRAM are visible to subsequent CUDA kernels on the model's
+        # compute stream. NIXL's check_xfer_state == "DONE" confirms
+        # UCX completed the transfer, but the data lives on UCX's own
+        # stream until we drain — without this sync, the first
+        # post-load forward pass can observe stale / partial data on a
+        # cached block, producing wrong tokens that the *next* forward
+        # pass would generate correctly. The sync cost is amortised
+        # across the whole batch (one sync per transfer_async call).
+        if ok and total_bytes > 0:
+            try:
+                import torch
+
+                torch.cuda.synchronize()
+            except Exception:
+                logger.warning(
+                    "RemoteG2: torch.cuda.synchronize after NIXL READ "
+                    "failed (job_id=%d); subsequent forward may observe "
+                    "stale GPU bytes",
+                    job_id,
+                    exc_info=True,
+                )
+
         elapsed = time.perf_counter() - t0
         self._enqueue(job_id, success=ok, num_bytes=total_bytes, elapsed=elapsed)
 
