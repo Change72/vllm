@@ -250,6 +250,10 @@ class SourceG2DescriptorRegistry:
         self._records: dict[int, SourceG2DescriptorRecord] = {}
         self._leases: dict[str, RemoteG2Lease] = {}
         self._lock = threading.RLock()
+        # Monotonic counter that guarantees lease_id uniqueness even
+        # when two threads land in resolve_and_lease at the same
+        # clock millisecond with the same (plan_id, request_id).
+        self._lease_id_counter: int = 0
 
         # Pool layout — set by the worker-side spec after KV caches are
         # registered. Until then, descriptor publish path is gated.
@@ -277,6 +281,24 @@ class SourceG2DescriptorRegistry:
         self.plan_resolved_count: int = 0
         self.plan_load_specs_emitted: int = 0
         self.plan_blocks_loaded: int = 0
+
+        # Source-side eviction protection. The CPUOffloadingManager's
+        # policy enforces eviction by ref_cnt and a per-call ``protected``
+        # set; a lease that has resolved a descriptor for hash X must
+        # bump policy.get(key_for_X).ref_cnt so a parallel store on the
+        # scheduler thread doesn't evict X out from under the in-flight
+        # NIXL READ. ``set_policy`` is first-wins: the SCHEDULER-side
+        # manager (where stores actually run) registers first; the
+        # worker-side manager's call is a no-op.
+        self._policy: Any = None
+        self._hash_to_key: dict[int, Any] = {}
+        # Lease pin counters and stats — independent from
+        # SourceG2DescriptorRecord.lease_count (which is a per-record
+        # display counter); these drive the actual policy.ref_cnt
+        # bumps and let tests assert pin/unpin balance.
+        self.pin_count_total: int = 0
+        self.unpin_count_total: int = 0
+        self.pin_failures: int = 0
 
     @classmethod
     def get_or_create(
@@ -425,6 +447,76 @@ class SourceG2DescriptorRegistry:
             self._records[block_hash_int] = record
         return record
 
+    # --- policy plumbing (scheduler-manager side) ---
+
+    def set_policy(self, policy: Any) -> bool:
+        """Register the CPUOffloadingManager's policy with the registry.
+
+        First-wins: only the first caller's policy is kept (the
+        scheduler-side manager wins because OffloadingConnectorScheduler
+        is constructed before OffloadingConnectorWorker in vLLM v1).
+        Returns True if this call did the install.
+        """
+        with self._lock:
+            if self._policy is None:
+                self._policy = policy
+                return True
+        return False
+
+    def record_key(self, block_hash_int: int, key: Any) -> None:
+        """Remember the OffloadKey associated with a published block_hash.
+
+        Called by the scheduler-side manager in ``complete_store`` so
+        the registry can later resolve hash → key → policy block when
+        a lease wants to pin the block against eviction.
+        """
+        with self._lock:
+            self._hash_to_key[int(block_hash_int)] = key
+
+    def forget_key(self, block_hash_int: int) -> None:
+        with self._lock:
+            self._hash_to_key.pop(int(block_hash_int), None)
+
+    def _pin_block_locked(self, block_hash_int: int) -> bool:
+        """Bump policy.get(key).ref_cnt for the given hash, atomic
+        under ``self._lock`` (caller must hold it).
+
+        Returns True on success, False if the block isn't in the
+        policy (e.g. evicted between resolve lookup and pin).
+        """
+        if self._policy is None:
+            # No policy registered yet — POC's pre-store smoke tests
+            # exercise this path (registry stands alone without a
+            # manager). Pin is a no-op; lease still tracks the hash
+            # for unpin balance.
+            self.pin_count_total += 1
+            return True
+        key = self._hash_to_key.get(int(block_hash_int))
+        if key is None:
+            self.pin_failures += 1
+            return False
+        block = self._policy.get(key)
+        if block is None or not block.is_ready:
+            self.pin_failures += 1
+            return False
+        block.ref_cnt += 1
+        self.pin_count_total += 1
+        return True
+
+    def _unpin_block_locked(self, block_hash_int: int) -> None:
+        """Decrement the policy block's ref_cnt for the given hash.
+        No-op if the policy isn't registered, the hash isn't known,
+        or the block has been removed."""
+        self.unpin_count_total += 1
+        if self._policy is None:
+            return
+        key = self._hash_to_key.get(int(block_hash_int))
+        if key is None:
+            return
+        block = self._policy.get(key)
+        if block is not None and block.ref_cnt > 0:
+            block.ref_cnt -= 1
+
     def upsert_descriptor(self, record: SourceG2DescriptorRecord) -> None:
         if record.source_worker_id != self.source_worker_id:
             raise ValueError("record source_worker_id does not match registry")
@@ -448,7 +540,14 @@ class SourceG2DescriptorRegistry:
             return self._records.get(int(block_hash))
 
     def _new_lease_id(self, plan_id: str, request_id: str) -> str:
-        return f"{plan_id}:{request_id}:{self._clock_ms()}"
+        # Combine clock + monotonic counter so concurrent resolves on
+        # the same (plan_id, request_id) within the same clock tick
+        # don't collide on the lease_id key. Counter is protected by
+        # ``self._lock``, which the caller is expected to hold.
+        self._lease_id_counter += 1
+        return (
+            f"{plan_id}:{request_id}:{self._clock_ms()}:{self._lease_id_counter}"
+        )
 
     def resolve_and_lease(
         self, plan: Mapping[str, Any] | RemoteKvReusePlan
@@ -493,13 +592,16 @@ class SourceG2DescriptorRegistry:
 
         identity_hashes = parsed.planned_hashes
         kv_hashes = parsed.planned_kv_block_hashes or identity_hashes
-        lease_id = self._new_lease_id(parsed.plan_id, parsed.request_id)
 
         descriptors: list[RemoteG2Descriptor] = []
         per_block_status: list[RemoteG2BlockStatus] = []
+        pinned_hashes: list[int] = []
         pin_refs: list[Any] = []
 
         with self._lock:
+            # Generate the lease_id inside the lock so the counter
+            # advances atomically with the lease table mutation.
+            lease_id = self._new_lease_id(parsed.plan_id, parsed.request_id)
             for i, identity_hash in enumerate(identity_hashes):
                 kv_hash = int(kv_hashes[i])
                 record = self._records.get(kv_hash)
@@ -516,16 +618,34 @@ class SourceG2DescriptorRegistry:
                         RemoteG2BlockStatus(int(identity_hash), "wrong_owner")
                     )
                     break
+                # Atomically pin the policy block so a concurrent
+                # CPU-pool eviction can't evict it out from under the
+                # in-flight transfer. On failure (e.g. block evicted
+                # between record lookup and now) record the status
+                # and stop the prefix.
+                if not self._pin_block_locked(kv_hash):
+                    per_block_status.append(
+                        RemoteG2BlockStatus(int(identity_hash), "pin_failed")
+                    )
+                    break
+                # Optional side-channel pin (TRT-LLM POC's
+                # find_and_pin_secondary_block_by_hash). Default None
+                # in the vLLM POC.
                 pin_ref: Any = None
                 if self._acquire_pin is not None:
                     try:
                         pin_ref = self._acquire_pin(record, lease_id)
                     except Exception:
+                        # Roll back the policy pin we just took.
+                        self._unpin_block_locked(kv_hash)
                         per_block_status.append(
-                            RemoteG2BlockStatus(int(identity_hash), "pin_failed")
+                            RemoteG2BlockStatus(
+                                int(identity_hash), "pin_failed"
+                            )
                         )
                         break
                 record.lease_count += 1
+                pinned_hashes.append(kv_hash)
                 pin_refs.append(pin_ref)
                 descriptors.append(
                     RemoteG2Descriptor(
@@ -544,6 +664,23 @@ class SourceG2DescriptorRegistry:
                         descriptor_generation=record.descriptor_generation,
                     )
                 )
+
+            # If no descriptors at all, release any partial pins we
+            # took so they don't leak. (E.g. the first block resolved
+            # but the second failed; the for-loop break left the
+            # first one pinned even though we won't return a lease.)
+            if not descriptors and pinned_hashes:
+                for h in pinned_hashes:
+                    self._unpin_block_locked(h)
+                # release_pin callback for any external pins we held.
+                if self._release_pin is not None:
+                    for ref in pin_refs:
+                        try:
+                            self._release_pin(ref)
+                        except Exception:
+                            pass
+                pinned_hashes = []
+                pin_refs = []
 
             if not descriptors:
                 return RemoteG2ResolveResult(
@@ -590,6 +727,9 @@ class SourceG2DescriptorRegistry:
                 record = self._records.get(int(block_hash))
                 if record is not None and record.lease_count > 0:
                     record.lease_count -= 1
+                # Decrement the policy block's ref_cnt — symmetric
+                # with the pin we took in resolve_and_lease.
+                self._unpin_block_locked(int(block_hash))
                 if self._release_pin is not None:
                     try:
                         self._release_pin(pin_ref)

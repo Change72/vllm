@@ -184,6 +184,7 @@ class RawNixlRemoteG2Adapter:
         local_mem_type: str = "VRAM",
         local_device_id: int = 0,
         poll_interval_s: float = 0.0005,
+        fault_inject_every: int = 0,
     ) -> None:
         if not local_layer_pool_base_ptrs:
             raise ValueError("local_layer_pool_base_ptrs must be non-empty")
@@ -200,6 +201,12 @@ class RawNixlRemoteG2Adapter:
         self._use_mock = use_mock or not NIXL_AVAILABLE or not backends
         self._peers: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        # Fault injection: when >0, every Nth read_block call raises
+        # RuntimeError. Used by the failure-recovery test suite to
+        # confirm transfer_handler propagates failures to vLLM's
+        # kv_load_failure_policy. Defaults to 0 (off).
+        self._fault_inject_every = int(fault_inject_every)
+        self._read_block_calls = 0
 
         if self._use_mock:
             self._agent: Any = _MockAgent(agent_name, self._local_layer_bases[0])
@@ -287,6 +294,11 @@ class RawNixlRemoteG2Adapter:
         """
         with self._lock:
             peer = self._peers.get(peer_name)
+            self._read_block_calls += 1
+            inject = (
+                self._fault_inject_every > 0
+                and self._read_block_calls % self._fault_inject_every == 0
+            )
         if peer is None:
             raise RuntimeError(f"peer {peer_name!r} not registered; call add_peer")
 
@@ -296,6 +308,11 @@ class RawNixlRemoteG2Adapter:
             raise RuntimeError(
                 f"peer {peer_name!r} layer count {n_layers} mismatches "
                 f"local {self.num_layers}"
+            )
+
+        if inject:
+            raise RuntimeError(
+                f"RemoteG2 fault injection: read_block #{self._read_block_calls}"
             )
 
         if self._use_mock:

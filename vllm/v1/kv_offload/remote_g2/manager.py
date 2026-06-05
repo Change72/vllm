@@ -95,7 +95,6 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             store_threshold=store_threshold,
             max_tracker_size=max_tracker_size,
         )
-        self._rlock = threading.RLock()
         # Shared singleton: both the scheduler-side spec and the
         # worker-side spec resolve the same registry instance via
         # ``get_or_create``, since in vLLM v1 each role constructs its
@@ -105,6 +104,20 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             source_dp_rank=source_dp_rank,
             lease_ttl_ms=lease_ttl_ms,
         )
+        # Share the registry's RLock for all manager-level operations.
+        # This is mandatory: the registry's resolve_and_lease path
+        # bumps policy.ref_cnt under the registry lock, and our
+        # complete_store / prepare_store / lookup paths mutate the
+        # same policy under self._rlock. Using a single lock avoids
+        # an AB-BA deadlock between the scheduler thread and the
+        # SourceG2RpcServer thread.
+        self._rlock = self.registry._lock
+        # Register our policy + first-wins: the scheduler-side manager
+        # (constructed first by OffloadingConnectorScheduler) wins; the
+        # worker-side manager's call is a no-op. The registry uses the
+        # registered policy to pin/unpin blocks against eviction during
+        # lease lifetime.
+        self.registry.set_policy(self._policy)
         # Keep these on the manager for reset_cache /tear-down only —
         # the registry holds the authoritative pool layout.
         self._tier = tier
@@ -332,16 +345,21 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
     ) -> PrepareStoreOutput | None:
         with self._rlock:
             output = super().prepare_store(keys, req_context)
-        if output is None:
-            return None
-        # Evictions get pulled out of the registry so peers stop trying
-        # to resolve dead block hashes.
-        if output.evicted_keys:
-            for key in output.evicted_keys:
-                block_hash_int = block_hash_to_router_int(
-                    get_offload_block_hash(key)
-                )
-                self.registry.remove_descriptor(block_hash_int)
+            if output is None:
+                return None
+            # Evictions get pulled out of the registry so peers stop
+            # trying to resolve dead block hashes, AND drop their
+            # hash → key mapping so pin attempts return "missing"
+            # cleanly. (The LRU policy can't pick blocks with
+            # ref_cnt > 0 in the first place, so evicted_keys here
+            # were always unpinned — see policies/lru.py:41.)
+            if output.evicted_keys:
+                for key in output.evicted_keys:
+                    block_hash_int = block_hash_to_router_int(
+                        get_offload_block_hash(key)
+                    )
+                    self.registry.remove_descriptor(block_hash_int)
+                    self.registry.forget_key(block_hash_int)
         return output
 
     def complete_store(
@@ -386,8 +404,16 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
     def reset_cache(self) -> None:
         with self._rlock:
             super().reset_cache()
-        for block_hash in list(self.registry._records.keys()):
-            self.registry.remove_descriptor(block_hash)
+            # Drop every descriptor, hash↔key entry, and active lease.
+            # reset_cache is only called when the policy is being
+            # fully wiped (e.g. on shutdown / engine restart), so any
+            # outstanding lease is meaningless and any peer holding
+            # one would error out on its next read regardless.
+            for block_hash in list(self.registry._records.keys()):
+                self.registry.remove_descriptor(block_hash)
+                self.registry.forget_key(block_hash)
+            for lease_id in list(self.registry._leases.keys()):
+                self.registry.release_lease(lease_id, reason="reset_cache")
 
     # --- registry population (must be called with _rlock held) ---
 
@@ -403,6 +429,12 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             block_hash_int = block_hash_to_router_int(
                 get_offload_block_hash(key)
             )
+            # Record (block_hash → key) so the registry can resolve a
+            # pin request back to a policy block. Must happen BEFORE
+            # upsert_for_block makes the descriptor visible to peers,
+            # otherwise a remote resolve query could see the
+            # descriptor but fail to pin its policy block.
+            self.registry.record_key(block_hash_int, key)
             self.registry.upsert_for_block(block_hash_int, block.block_id)
 
 
