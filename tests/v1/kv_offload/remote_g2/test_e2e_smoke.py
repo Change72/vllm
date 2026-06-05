@@ -116,7 +116,11 @@ def _source_setup(
         )
 
     bundle = _build_mock_source_bundle(
-        "src-agent", pool_base, NUM_BLOCKS * PAGE_SIZE, source_generation=1
+        "src-agent",
+        [pool_base],
+        [NUM_BLOCKS * PAGE_SIZE],
+        PAGE_SIZE,
+        source_generation=1,
     )
 
     server = SourceG2RpcServer(registry, socket_path=socket_path, recv_timeout_ms=100)
@@ -155,8 +159,8 @@ def test_remote_g2_end_to_end_with_mock_nixl(tmp_socket: str) -> None:
         target_base = _ptr_of(target_pool)
         adapter = RawNixlRemoteG2Adapter(
             "tgt-agent",
-            target_base,
-            len(target_pool),
+            [target_base],
+            [len(target_pool)],
             use_mock=True,
         )
         client = TargetG2RpcClient(tmp_socket, timeout_ms=2_000)
@@ -169,12 +173,14 @@ def test_remote_g2_end_to_end_with_mock_nixl(tmp_socket: str) -> None:
         assert meta is not None, "source should publish a bundle"
         assert meta["source_worker_id"] == 1
         assert meta["pool_size_bytes"] == NUM_BLOCKS * PAGE_SIZE
+        assert len(meta["layer_pool_base_ptrs"]) == 1
+        assert meta["page_size_bytes"] == PAGE_SIZE
 
         adapter.add_peer(
             peer_name="src-agent",
             peer_agent_metadata=meta["agent_metadata"],
-            peer_pool_base_ptr=meta["pool_base_ptr"],
-            peer_pool_size_bytes=meta["pool_size_bytes"],
+            peer_layer_pool_base_ptrs=meta["layer_pool_base_ptrs"],
+            peer_layer_pool_size_bytes=meta["layer_pool_size_bytes"],
         )
 
         # Step 2: resolve the plan; expect a full prefix hit.

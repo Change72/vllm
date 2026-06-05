@@ -74,6 +74,11 @@ class NixlSourceBundle(Protocol):
 
     Field names mirror ``remote_g2_source_setup.NixlSourceBundle`` so the
     target side decodes the bundle the same way regardless of backend.
+    The new ``layer_pool_base_ptrs`` / ``layer_pool_size_bytes`` /
+    ``page_size_bytes`` fields are vLLM-side additions for the
+    multi-layer per-tensor KV layout; TRT-LLM peers that don't know
+    about them are unaffected (they only need ``pool_base_ptr`` /
+    ``pool_size_bytes`` from the legacy single-pool shape).
     """
 
     source_generation: int
@@ -81,6 +86,9 @@ class NixlSourceBundle(Protocol):
     agent_desc: bytes
     pool_base_ptr: int
     pool_size_bytes: int
+    layer_pool_base_ptrs: list[int]
+    layer_pool_size_bytes: list[int]
+    page_size_bytes: int
 
     @property
     def agent(self) -> Any: ...
@@ -285,8 +293,16 @@ class SourceG2RpcServer:
                 "agent_metadata_b64": base64.b64encode(
                     bundle.agent_desc
                 ).decode("ascii"),
+                # Legacy single-pool fields (= layer 0 in multi-layer
+                # mode). Kept for TRT-LLM-compatible peers.
                 "pool_base_ptr": bundle.pool_base_ptr,
                 "pool_size_bytes": bundle.pool_size_bytes,
+                # vLLM multi-layer: per-layer base pointers + sizes +
+                # a uniform per-block page size. Peers that know about
+                # multi-layer use these; legacy peers ignore them.
+                "layer_pool_base_ptrs": list(bundle.layer_pool_base_ptrs),
+                "layer_pool_size_bytes": list(bundle.layer_pool_size_bytes),
+                "page_size_bytes": int(bundle.page_size_bytes),
             },
         }
 

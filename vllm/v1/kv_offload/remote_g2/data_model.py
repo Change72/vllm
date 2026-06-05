@@ -253,7 +253,15 @@ class SourceG2DescriptorRegistry:
 
         # Pool layout — set by the worker-side spec after KV caches are
         # registered. Until then, descriptor publish path is gated.
-        self._pool_base_ptr: int = 0
+        # vLLM v1 allocates ONE CPU tensor per transformer layer (e.g. 36
+        # for Qwen3-8B). All layers share the same block-id space (a
+        # given block_id maps to the same row in every per-layer
+        # tensor), but each layer has its own contiguous pool with its
+        # own base pointer. ``_layer_pool_base_ptrs[i]`` is the start of
+        # layer i's pool. Page size and row stride are uniform across
+        # layers in homogeneous models (asserted in set_pool_layout).
+        self._layer_pool_base_ptrs: list[int] = []
+        self._layer_pool_size_bytes: list[int] = []
         self._page_size_bytes: int = 0
         self._row_stride_bytes: int = 0
         self._rank: int = 0
@@ -308,7 +316,8 @@ class SourceG2DescriptorRegistry:
     def set_pool_layout(
         self,
         *,
-        pool_base_ptr: int,
+        layer_pool_base_ptrs: list[int],
+        layer_pool_size_bytes: list[int],
         page_size_bytes: int,
         rank: int = 0,
         num_workers: int = 1,
@@ -319,10 +328,19 @@ class SourceG2DescriptorRegistry:
     ) -> None:
         if page_size_bytes <= 0:
             raise ValueError("page_size_bytes must be positive")
-        if pool_base_ptr <= 0:
-            raise ValueError("pool_base_ptr must be non-zero")
+        if not layer_pool_base_ptrs:
+            raise ValueError("layer_pool_base_ptrs must be non-empty")
+        if len(layer_pool_base_ptrs) != len(layer_pool_size_bytes):
+            raise ValueError(
+                "layer_pool_base_ptrs and layer_pool_size_bytes "
+                "must have the same length"
+            )
+        for i, ptr in enumerate(layer_pool_base_ptrs):
+            if ptr <= 0:
+                raise ValueError(f"layer {i} pool_base_ptr is non-positive")
         with self._lock:
-            self._pool_base_ptr = int(pool_base_ptr)
+            self._layer_pool_base_ptrs = [int(p) for p in layer_pool_base_ptrs]
+            self._layer_pool_size_bytes = [int(s) for s in layer_pool_size_bytes]
             self._page_size_bytes = int(page_size_bytes)
             self._rank = int(rank)
             self._row_stride_bytes = int(
@@ -335,7 +353,26 @@ class SourceG2DescriptorRegistry:
             self._device_id = int(device_id)
 
     def pool_layout_ready(self) -> bool:
-        return self._pool_base_ptr > 0 and self._page_size_bytes > 0
+        return (
+            bool(self._layer_pool_base_ptrs)
+            and self._page_size_bytes > 0
+        )
+
+    @property
+    def num_layers(self) -> int:
+        return len(self._layer_pool_base_ptrs)
+
+    @property
+    def layer_pool_base_ptrs(self) -> list[int]:
+        return list(self._layer_pool_base_ptrs)
+
+    @property
+    def layer_pool_size_bytes(self) -> list[int]:
+        return list(self._layer_pool_size_bytes)
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self._page_size_bytes
 
     def upsert_for_block(
         self, block_hash_int: int, block_id: int
@@ -344,6 +381,13 @@ class SourceG2DescriptorRegistry:
 
         Returns the record (so callers can log) or ``None`` if the pool
         layout has not been set yet (descriptor publish is gated).
+
+        Multi-layer pools share the same ``block_id`` namespace and the
+        same byte offset within each per-layer pool (row stride is
+        uniform). The descriptor stores ``block_id`` and the per-layer
+        ``byte_offset``; the transfer handler combines those with the
+        per-layer base pointers in the bundle metadata to issue one
+        NIXL READ per layer.
         """
         with self._lock:
             if not self.pool_layout_ready():
@@ -366,11 +410,15 @@ class SourceG2DescriptorRegistry:
                 block_id=block_id,
                 metadata={
                     "nixl_memory_desc": {
-                        "ptr": self._pool_base_ptr + byte_offset,
+                        # Layer 0 ptr kept for inspection / debugging;
+                        # the transfer handler uses the bundle's full
+                        # layer_pool_base_ptrs list.
+                        "ptr": self._layer_pool_base_ptrs[0] + byte_offset,
                         "size": self._page_size_bytes,
                         "device_id": self._device_id,
                         "memory_type": "DRAM",
                         "name": self._pool_id,
+                        "num_layers": len(self._layer_pool_base_ptrs),
                     }
                 },
             )

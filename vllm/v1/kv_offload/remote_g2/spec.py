@@ -206,31 +206,54 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         if not cpu_tensors:
             logger.warning(
                 "RemoteG2OffloadingSpec: no CPU tensors materialised; "
-                "skipping NIXL agent setup. Multi-tensor models need M4."
+                "skipping NIXL agent setup."
             )
             return
 
-        cpu_tensor = cpu_tensors[0]
-        page_size_bytes = int(cpu_tensor.shape[-1])
-        num_cpu_blocks = int(cpu_tensor.shape[0])
-        total_bytes = page_size_bytes * num_cpu_blocks
-        host_pool_base = int(cpu_tensor.data_ptr())
+        # vLLM v1 allocates one CPU tensor per transformer layer (e.g.
+        # 36 for Qwen3-8B). All must be registered with NIXL and
+        # transferred per block; otherwise non-layer-0 KV stays
+        # uninitialised on the target and the model produces garbage.
+        layer_page_sizes = [int(t.shape[-1]) for t in cpu_tensors]
+        if len(set(layer_page_sizes)) != 1:
+            raise RuntimeError(
+                f"RemoteG2OffloadingSpec: heterogeneous per-layer CPU "
+                f"page sizes are not supported in this POC: "
+                f"{layer_page_sizes!r}. The transfer math assumes a "
+                f"uniform stride across layers."
+            )
+        page_size_bytes = layer_page_sizes[0]
+        num_cpu_blocks = int(cpu_tensors[0].shape[0])
+        cpu_layer_base_ptrs = [int(t.data_ptr()) for t in cpu_tensors]
+        cpu_layer_sizes = [
+            page_size_bytes * int(t.shape[0]) for t in cpu_tensors
+        ]
 
-        # Push pool layout to manager so descriptors carry correct
-        # byte_offset + nixl_memory_desc.ptr from now on.
+        # Push pool layout to the shared registry; descriptor publish
+        # path runs against the per-layer ptrs from now on.
         manager.set_pool_layout(
-            pool_base_ptr=host_pool_base,
+            layer_pool_base_ptrs=cpu_layer_base_ptrs,
+            layer_pool_size_bytes=cpu_layer_sizes,
             page_size_bytes=page_size_bytes,
             rank=0,
             num_workers=1,
+        )
+        logger.info(
+            "RemoteG2OffloadingSpec: registered %d CPU layer pools "
+            "(num_blocks=%d, page_size=%d bytes/block, total=%.2f GiB)",
+            len(cpu_tensors),
+            num_cpu_blocks,
+            page_size_bytes,
+            sum(cpu_layer_sizes) / (1 << 30),
         )
 
         # Source NIXL agent (or mock).
         agent_name = f"remote-g2-src-{self.source_worker_id}"
         bundle = build_source_agent(
             agent_name,
-            host_pool_base,
-            total_bytes,
+            cpu_layer_base_ptrs,
+            cpu_layer_sizes,
+            page_size_bytes,
             source_generation=1,
             backends=() if self.use_mock_nixl else ("UCX",),
         )
@@ -238,8 +261,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         if bundle is None:
             logger.warning(
                 "RemoteG2OffloadingSpec: source NIXL bundle unavailable; "
-                "peers cannot fetch metadata via get_metadata until M4 "
-                "retries this path."
+                "peers cannot fetch metadata via get_metadata."
             )
 
         # ZMQ REP server (binds the engine-side socket).
@@ -259,19 +281,29 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 self.source_worker_id,
             )
 
-        # Target-side adapter. Uses the local GPU pool tensors as the
-        # transfer destination. Single-tensor POC.
-        gpu_tensor_blob = kv_caches.tensors[0]
-        gpu_base = int(gpu_tensor_blob.tensor.data_ptr())
-        gpu_total = int(
-            gpu_tensor_blob.tensor.numel() * gpu_tensor_blob.tensor.element_size()
-        )
+        # Target-side adapter. Uses the local GPU pool tensors (one per
+        # layer) as the transfer destination.
+        gpu_layer_bases = [
+            int(t.tensor.data_ptr()) for t in kv_caches.tensors
+        ]
+        gpu_layer_sizes = [
+            int(t.tensor.numel() * t.tensor.element_size())
+            for t in kv_caches.tensors
+        ]
+        if len(gpu_layer_bases) != len(cpu_layer_base_ptrs):
+            logger.warning(
+                "RemoteG2OffloadingSpec: GPU has %d layer tensors but "
+                "CPU pool has %d; target transfers will reject peers "
+                "with a different layer count.",
+                len(gpu_layer_bases),
+                len(cpu_layer_base_ptrs),
+            )
         target_agent_name = f"remote-g2-tgt-{self.source_worker_id}"
         try:
             self._target_adapter = RawNixlRemoteG2Adapter(
                 target_agent_name,
-                gpu_base,
-                gpu_total,
+                gpu_layer_bases,
+                gpu_layer_sizes,
                 backends=("UCX",),
                 use_mock=self.use_mock_nixl,
             )
@@ -283,9 +315,10 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             self._target_adapter = None
 
         if self._target_adapter is not None:
+            gpu_page_size = int(kv_caches.tensors[0].page_size_bytes)
             self._transfer_handler = RemoteG2TransferHandler(
                 adapter=self._target_adapter,
-                gpu_page_size_bytes=gpu_tensor_blob.page_size_bytes,
+                gpu_page_size_bytes=gpu_page_size,
                 ensure_peer=self._ensure_peer,
                 on_load_done=self._on_load_done,
             )
@@ -360,11 +393,19 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         if bundle is None:
             return False
         try:
+            # Prefer the multi-layer fields when the peer publishes
+            # them; fall back to the legacy single-pool fields wrapped
+            # as a one-layer list so the adapter API stays uniform.
+            layer_bases = bundle.get("layer_pool_base_ptrs")
+            layer_sizes = bundle.get("layer_pool_size_bytes")
+            if not layer_bases or not layer_sizes:
+                layer_bases = [int(bundle.get("pool_base_ptr", 0))]
+                layer_sizes = [int(bundle.get("pool_size_bytes", 0))]
             self._target_adapter.add_peer(
                 peer_name,
                 peer_agent_metadata=bundle.get("agent_metadata", b""),
-                peer_pool_base_ptr=int(bundle.get("pool_base_ptr", 0)),
-                peer_pool_size_bytes=int(bundle.get("pool_size_bytes", 0)),
+                peer_layer_pool_base_ptrs=[int(p) for p in layer_bases],
+                peer_layer_pool_size_bytes=[int(s) for s in layer_sizes],
             )
             return True
         except Exception:

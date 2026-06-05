@@ -50,11 +50,20 @@ except ImportError:
 @dataclass
 class NixlSourceBundle:
     """What the source publishes via ``get_metadata`` so peers can
-    reach its host pool. Same shape as TRT-LLM POC's bundle.
+    reach its host pool.
 
-    ``agent`` is the raw nixl_agent (or a mock-transport handle) — used
-    by the source REP loop to call ``add_remote_agent`` when peers send
-    their metadata in the ``peer_metadata_b64`` payload.
+    vLLM v1 allocates one CPU tensor per transformer layer (e.g. 36 for
+    Qwen3-8B). Each layer is a contiguous DRAM region with its own
+    base pointer. ``layer_pool_base_ptrs`` carries one base pointer per
+    layer; the byte offset for ``block_id`` within layer ``i`` is
+    ``block_id * page_size_bytes`` (uniform stride across layers).
+
+    For backward compatibility with the TRT-LLM-shape bundle (which
+    assumed a single contiguous pool), ``pool_base_ptr`` is the first
+    layer's pointer and ``pool_size_bytes`` is its size. Peers that
+    know about multi-layer should consult ``layer_pool_base_ptrs``;
+    peers that don't will only see layer 0 (and will produce garbage on
+    multi-layer models, which is the bug we're fixing here).
     """
 
     agent: Any
@@ -63,24 +72,37 @@ class NixlSourceBundle:
     agent_desc: bytes
     pool_base_ptr: int
     pool_size_bytes: int
+    layer_pool_base_ptrs: list[int]
+    layer_pool_size_bytes: list[int]
+    page_size_bytes: int
 
 
 def build_source_agent(
     agent_name: str,
-    pool_base_ptr: int,
-    pool_size_bytes: int,
+    layer_pool_base_ptrs: list[int],
+    layer_pool_size_bytes: list[int],
+    page_size_bytes: int,
     *,
     source_generation: int = 1,
     backends: tuple[str, ...] = ("UCX",),
     mem_type: str = "DRAM",
     device_id: int = 0,
 ) -> NixlSourceBundle | None:
-    """Construct the source NIXL agent and register the host pool.
+    """Construct the source NIXL agent and register **every** per-layer
+    pool with the agent. One ``register_memory`` call covers all
+    layers (NIXL accepts a list of regions).
 
     Returns ``None`` on failure. When ``backends`` is empty OR NIXL is
     not importable, falls back to the byte-copy mock transport so the
     rest of the pipeline can still be exercised in CI.
     """
+    if not layer_pool_base_ptrs:
+        raise ValueError("layer_pool_base_ptrs must be non-empty")
+    if len(layer_pool_base_ptrs) != len(layer_pool_size_bytes):
+        raise ValueError(
+            "layer_pool_base_ptrs / layer_pool_size_bytes length mismatch"
+        )
+
     if not NIXL_AVAILABLE or not backends:
         if not NIXL_AVAILABLE:
             logger.warning(
@@ -89,15 +111,14 @@ def build_source_agent(
                 "peers can negotiate without code changes."
             )
         return _build_mock_source_bundle(
-            agent_name, pool_base_ptr, pool_size_bytes, source_generation
+            agent_name,
+            layer_pool_base_ptrs,
+            layer_pool_size_bytes,
+            page_size_bytes,
+            source_generation,
         )
 
     try:
-        # Positional args mirror the nixl examples: (enable_prog_thread,
-        # enable_listen_thread, listen_port, capture_telemetry,
-        # num_threads, backends).
-        # Mirror the NIXL basic_two_peers example: enable_prog_thread=True,
-        # enable_listen_thread=True, listen_port=0 (auto-assigned).
         config = nixl_agent_config(True, True, 0, False, 0, list(backends))
         agent = nixl_agent(agent_name, config, instantiate_all=False)
     except Exception:
@@ -105,15 +126,15 @@ def build_source_agent(
         return None
 
     try:
-        # 4-tuple registration list: (addr, size, device_id, "extra").
-        agent.register_memory(
-            [(pool_base_ptr, pool_size_bytes, device_id, "")], mem_type=mem_type
-        )
+        reg_list = [
+            (int(p), int(s), device_id, "")
+            for p, s in zip(layer_pool_base_ptrs, layer_pool_size_bytes)
+        ]
+        agent.register_memory(reg_list, mem_type=mem_type)
     except Exception:
         logger.exception(
-            "RemoteG2: register_memory failed for pool 0x%x size=%d",
-            pool_base_ptr,
-            pool_size_bytes,
+            "RemoteG2: register_memory failed for %d layer pools",
+            len(layer_pool_base_ptrs),
         )
         return None
 
@@ -128,28 +149,35 @@ def build_source_agent(
         source_generation=source_generation,
         remote_name=agent_name,
         agent_desc=agent_desc,
-        pool_base_ptr=pool_base_ptr,
-        pool_size_bytes=pool_size_bytes,
+        pool_base_ptr=int(layer_pool_base_ptrs[0]),
+        pool_size_bytes=int(layer_pool_size_bytes[0]),
+        layer_pool_base_ptrs=[int(p) for p in layer_pool_base_ptrs],
+        layer_pool_size_bytes=[int(s) for s in layer_pool_size_bytes],
+        page_size_bytes=int(page_size_bytes),
     )
 
 
 class RawNixlRemoteG2Adapter:
-    """Target-side adapter performing block-granular NIXL READs.
+    """Target-side adapter performing per-layer NIXL READs.
 
-    Idempotent per-peer setup: the first time a peer is seen, the
-    adapter calls ``add_remote_agent`` and ``prep_xfer_dlist`` against
-    the peer's whole pool (so block-indexed READs can subset cheaply).
-    ``read_block`` then performs the actual transfer for one block.
+    vLLM v1 allocates one CPU tensor per transformer layer (e.g. 36 for
+    Qwen3-8B) and similarly one GPU tensor per layer for the target's
+    KV cache. The adapter takes the *list* of per-layer base pointers
+    on each side, registers all of them with NIXL in a single
+    ``register_memory`` call, and on each ``read_block`` issues one
+    batched NIXL transfer whose source/destination descriptor list has
+    ``num_layers`` entries — one per layer at the requested block
+    offset. A single ``initialize_xfer`` + ``transfer`` + completion
+    poll covers the whole block, including all its layers.
 
-    For the mock transport, transfers are bytes-level memcpy via a
-    shared ``MockPeerRegistry`` keyed by ``remote_name``.
+    The mock transport mirrors this by memcpy-ing every layer.
     """
 
     def __init__(
         self,
         agent_name: str,
-        local_pool_base_ptr: int,
-        local_pool_size_bytes: int,
+        local_layer_pool_base_ptrs: list[int],
+        local_layer_pool_size_bytes: list[int],
         *,
         backends: tuple[str, ...] = ("UCX",),
         use_mock: bool = False,
@@ -157,9 +185,15 @@ class RawNixlRemoteG2Adapter:
         local_device_id: int = 0,
         poll_interval_s: float = 0.0005,
     ) -> None:
+        if not local_layer_pool_base_ptrs:
+            raise ValueError("local_layer_pool_base_ptrs must be non-empty")
+        if len(local_layer_pool_base_ptrs) != len(local_layer_pool_size_bytes):
+            raise ValueError(
+                "local_layer_pool_base_ptrs / size_bytes length mismatch"
+            )
         self._agent_name = agent_name
-        self._local_base = int(local_pool_base_ptr)
-        self._local_size = int(local_pool_size_bytes)
+        self._local_layer_bases = [int(p) for p in local_layer_pool_base_ptrs]
+        self._local_layer_sizes = [int(s) for s in local_layer_pool_size_bytes]
         self._local_mem_type = local_mem_type
         self._local_device_id = int(local_device_id)
         self._poll_interval_s = float(poll_interval_s)
@@ -168,42 +202,56 @@ class RawNixlRemoteG2Adapter:
         self._lock = threading.Lock()
 
         if self._use_mock:
-            self._agent: Any = _MockAgent(agent_name, local_pool_base_ptr)
+            self._agent: Any = _MockAgent(agent_name, self._local_layer_bases[0])
             self._agent_metadata = _MockAgent.encode_metadata(agent_name)
             return
 
-        # Mirror the NIXL basic_two_peers example: enable_prog_thread=True,
-        # enable_listen_thread=True, listen_port=0 (auto-assigned).
         config = nixl_agent_config(True, True, 0, False, 0, list(backends))
         self._agent = nixl_agent(agent_name, config, instantiate_all=False)
-        self._agent.register_memory(
-            [(self._local_base, self._local_size, self._local_device_id, "")],
-            mem_type=self._local_mem_type,
-        )
+        reg_list = [
+            (p, s, self._local_device_id, "")
+            for p, s in zip(self._local_layer_bases, self._local_layer_sizes)
+        ]
+        self._agent.register_memory(reg_list, mem_type=self._local_mem_type)
         self._agent_metadata = self._agent.get_agent_metadata()
 
     @property
     def agent_metadata(self) -> bytes:
         return self._agent_metadata
 
+    @property
+    def num_layers(self) -> int:
+        return len(self._local_layer_bases)
+
     def add_peer(
         self,
         peer_name: str,
         peer_agent_metadata: bytes,
-        peer_pool_base_ptr: int,
-        peer_pool_size_bytes: int,
+        peer_layer_pool_base_ptrs: list[int],
+        peer_layer_pool_size_bytes: list[int],
         *,
         peer_mem_type: str = "DRAM",
         peer_device_id: int = 0,
     ) -> None:
-        """Idempotent: register the source peer's pool for later READs."""
+        """Idempotent: register the source peer's per-layer pools."""
+        if not peer_layer_pool_base_ptrs:
+            raise ValueError("peer_layer_pool_base_ptrs must be non-empty")
+        if len(peer_layer_pool_base_ptrs) != len(peer_layer_pool_size_bytes):
+            raise ValueError(
+                "peer_layer_pool_base_ptrs / size_bytes length mismatch"
+            )
+        if len(peer_layer_pool_base_ptrs) != self.num_layers:
+            raise ValueError(
+                f"peer has {len(peer_layer_pool_base_ptrs)} layers but "
+                f"local adapter has {self.num_layers} (model mismatch?)"
+            )
         with self._lock:
             if peer_name in self._peers:
                 return
             if self._use_mock:
                 self._peers[peer_name] = {
-                    "base_ptr": int(peer_pool_base_ptr),
-                    "size": int(peer_pool_size_bytes),
+                    "layer_bases": [int(p) for p in peer_layer_pool_base_ptrs],
+                    "layer_sizes": [int(s) for s in peer_layer_pool_size_bytes],
                     "metadata": peer_agent_metadata,
                 }
                 return
@@ -216,8 +264,8 @@ class RawNixlRemoteG2Adapter:
             )
             self._peers[peer_name] = {
                 "handle": remote_handle,
-                "peer_base": int(peer_pool_base_ptr),
-                "peer_size": int(peer_pool_size_bytes),
+                "layer_bases": [int(p) for p in peer_layer_pool_base_ptrs],
+                "layer_sizes": [int(s) for s in peer_layer_pool_size_bytes],
                 "peer_mem_type": peer_mem_type,
                 "peer_device_id": int(peer_device_id),
             }
@@ -229,46 +277,61 @@ class RawNixlRemoteG2Adapter:
         local_byte_offset: int,
         byte_length: int,
     ) -> None:
-        """Synchronous block-sized READ from peer's pool.
+        """Synchronous block-sized READ across **all** layers.
 
-        For real NIXL: descriptors are built per-call via
-        ``get_xfer_descs`` and the transfer is initialised with
-        ``initialize_xfer``. M4 can switch to ``prep_xfer_dlist`` +
-        ``make_prepped_xfer`` once the per-block dlist layout is fixed.
+        Builds a transfer descriptor list with one entry per layer (the
+        peer's layer pool plus its block byte offset, paired with the
+        local layer pool plus the local block byte offset). Issues one
+        ``initialize_xfer`` / ``transfer`` / completion poll covering
+        the full block.
         """
         with self._lock:
             peer = self._peers.get(peer_name)
         if peer is None:
             raise RuntimeError(f"peer {peer_name!r} not registered; call add_peer")
 
+        peer_layer_bases = peer["layer_bases"]
+        n_layers = len(peer_layer_bases)
+        if n_layers != self.num_layers:
+            raise RuntimeError(
+                f"peer {peer_name!r} layer count {n_layers} mismatches "
+                f"local {self.num_layers}"
+            )
+
         if self._use_mock:
             import ctypes
 
-            ctypes.memmove(
-                self._local_base + local_byte_offset,
-                int(peer["base_ptr"]) + peer_byte_offset,
-                byte_length,
-            )
+            for i in range(n_layers):
+                ctypes.memmove(
+                    self._local_layer_bases[i] + local_byte_offset,
+                    int(peer_layer_bases[i]) + peer_byte_offset,
+                    byte_length,
+                )
             return
 
         local_descs = self._agent.get_xfer_descs(
-            [(self._local_base + local_byte_offset, byte_length, self._local_device_id)],
+            [
+                (
+                    self._local_layer_bases[i] + local_byte_offset,
+                    byte_length,
+                    self._local_device_id,
+                )
+                for i in range(n_layers)
+            ],
             mem_type=self._local_mem_type,
         )
         remote_descs = self._agent.get_xfer_descs(
             [
                 (
-                    peer["peer_base"] + peer_byte_offset,
+                    int(peer_layer_bases[i]) + peer_byte_offset,
                     byte_length,
                     peer["peer_device_id"],
                 )
+                for i in range(n_layers)
             ],
             mem_type=peer["peer_mem_type"],
         )
 
-        # Wait until remote metadata is loaded on the agent (loaded
-        # synchronously by add_remote_agent under the hood, but
-        # check_remote_metadata polls UCX readiness).
         deadline = time.monotonic() + 5.0
         while not self._agent.check_remote_metadata(peer["handle"]):
             if time.monotonic() > deadline:
@@ -327,16 +390,20 @@ class _MockAgent:
 
 def _build_mock_source_bundle(
     agent_name: str,
-    pool_base_ptr: int,
-    pool_size_bytes: int,
+    layer_pool_base_ptrs: list[int],
+    layer_pool_size_bytes: list[int],
+    page_size_bytes: int,
     source_generation: int,
 ) -> NixlSourceBundle:
-    agent = _MockAgent(agent_name, pool_base_ptr)
+    agent = _MockAgent(agent_name, int(layer_pool_base_ptrs[0]))
     return NixlSourceBundle(
         agent=agent,
         source_generation=source_generation,
         remote_name=agent_name,
         agent_desc=_MockAgent.encode_metadata(agent_name),
-        pool_base_ptr=int(pool_base_ptr),
-        pool_size_bytes=int(pool_size_bytes),
+        pool_base_ptr=int(layer_pool_base_ptrs[0]),
+        pool_size_bytes=int(layer_pool_size_bytes[0]),
+        layer_pool_base_ptrs=[int(p) for p in layer_pool_base_ptrs],
+        layer_pool_size_bytes=[int(s) for s in layer_pool_size_bytes],
+        page_size_bytes=int(page_size_bytes),
     )

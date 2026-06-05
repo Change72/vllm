@@ -125,7 +125,8 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
     def set_pool_layout(
         self,
         *,
-        pool_base_ptr: int,
+        layer_pool_base_ptrs: list[int],
+        layer_pool_size_bytes: list[int],
         page_size_bytes: int,
         rank: int = 0,
         num_workers: int = 1,
@@ -134,10 +135,13 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         """Forward pool layout to the shared registry.
 
         Required before descriptors can carry a working
-        ``nixl_memory_desc``. Called from the worker-side spec.
+        ``nixl_memory_desc``. Called from the worker-side spec with
+        one base pointer + size per transformer layer (vLLM v1
+        allocates one CPU tensor per layer).
         """
         self.registry.set_pool_layout(
-            pool_base_ptr=pool_base_ptr,
+            layer_pool_base_ptrs=layer_pool_base_ptrs,
+            layer_pool_size_bytes=layer_pool_size_bytes,
             page_size_bytes=page_size_bytes,
             rank=rank,
             num_workers=num_workers,
