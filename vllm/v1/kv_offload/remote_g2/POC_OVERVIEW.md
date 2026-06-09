@@ -195,20 +195,17 @@ The minimal pieces:
 
 ```bash
 # vLLM with the Remote G2 module
-git clone https://github.com/<FORK_OWNER>/vllm.git
+git clone https://github.com/linhu-nv/vllm.git
 cd vllm
-git checkout <VLLM_BRANCH>           # e.g. feat/kv-p2p-remote-g2
+git checkout feat/kv-p2p-remote-g2
 cd ..
 
 # Dynamo with the vLLM bridge (branched off oandreeva-kv-p2p-v1-followups)
-git clone https://github.com/<FORK_OWNER>/dynamo.git
+git clone https://github.com/linhu-nv/dynamo.git
 cd dynamo
-git checkout <DYNAMO_BRANCH>         # e.g. feat/kv-p2p-vllm-bridge
+git checkout feat/kv-p2p-vllm-bridge
 cd ..
 ```
-
-Replace `<FORK_OWNER>`, `<VLLM_BRANCH>`, `<DYNAMO_BRANCH>` with the
-values published in the PoC release notes.
 
 ### 2.3 Container
 
