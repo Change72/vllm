@@ -245,6 +245,11 @@ class SourceG2RpcServer:
                 "source_generation": self._registry.source_generation,
                 "sample_block_hashes": [h for h, _ in records[:sample_limit]],
                 "target_stats": target_stats,
+                "pin_count_total": int(self._registry.pin_count_total),
+                "unpin_count_total": int(self._registry.unpin_count_total),
+                "pin_failures": int(self._registry.pin_failures),
+                "hash_to_key_count": len(self._registry._hash_to_key),
+                "policy_registered": self._registry._policy is not None,
             },
         }
 

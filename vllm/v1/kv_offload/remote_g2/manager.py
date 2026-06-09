@@ -112,11 +112,13 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         # an AB-BA deadlock between the scheduler thread and the
         # SourceG2RpcServer thread.
         self._rlock = self.registry._lock
-        # Register our policy + first-wins: the scheduler-side manager
-        # (constructed first by OffloadingConnectorScheduler) wins; the
-        # worker-side manager's call is a no-op. The registry uses the
-        # registered policy to pin/unpin blocks against eviction during
-        # lease lifetime.
+        # Register our policy + last-wins: in vLLM v1's EngineCore
+        # startup, ``_initialize_kv_caches`` runs BEFORE the Scheduler
+        # is constructed, so the WORKER-role connector is built first
+        # (its policy is empty since ``complete_store`` is only ever
+        # run on the SCHEDULER side). Last-wins guarantees the
+        # scheduler's populated policy is what the source RPC sees
+        # when it pins blocks for an inbound lease.
         self.registry.set_policy(self._policy)
         # Keep these on the manager for reset_cache /tear-down only —
         # the registry holds the authoritative pool layout.

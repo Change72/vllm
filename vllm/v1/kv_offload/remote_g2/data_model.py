@@ -17,11 +17,14 @@ with vLLM-specific simplifications:
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 REMOTE_KV_REUSE_PLAN_VERSION = 1
 REMOTE_G2_TIERS = frozenset({"host_pinned", "g2"})
@@ -452,16 +455,25 @@ class SourceG2DescriptorRegistry:
     def set_policy(self, policy: Any) -> bool:
         """Register the CPUOffloadingManager's policy with the registry.
 
-        First-wins: only the first caller's policy is kept (the
-        scheduler-side manager wins because OffloadingConnectorScheduler
-        is constructed before OffloadingConnectorWorker in vLLM v1).
-        Returns True if this call did the install.
+        Last-wins. In vLLM v1's EngineCore startup, the WORKER-role
+        connector is constructed FIRST (inside ``_initialize_kv_caches``
+        → ``gpu_worker.ensure_kv_transfer_initialized``), and the
+        SCHEDULER-role connector is constructed afterwards. Only the
+        scheduler-side manager runs ``complete_store`` and populates
+        its policy; the worker-side manager's policy stays empty
+        forever. With last-wins, the scheduler's (populated) policy is
+        the one the source RPC sees, so plan resolves can pin live
+        blocks. Returns True (always installs).
         """
         with self._lock:
-            if self._policy is None:
-                self._policy = policy
-                return True
-        return False
+            previous = self._policy
+            self._policy = policy
+        logger.info(
+            "RemoteG2 registry.set_policy: installed %r (replaced=%s)",
+            type(policy).__name__,
+            previous is not None,
+        )
+        return True
 
     def record_key(self, block_hash_int: int, key: Any) -> None:
         """Remember the OffloadKey associated with a published block_hash.
@@ -494,10 +506,50 @@ class SourceG2DescriptorRegistry:
         key = self._hash_to_key.get(int(block_hash_int))
         if key is None:
             self.pin_failures += 1
+            logger.warning(
+                "RemoteG2: pin_failed for hash=%d cause=no_key_registered "
+                "(records=%d, keys=%d)",
+                int(block_hash_int),
+                len(self._records),
+                len(self._hash_to_key),
+            )
             return False
         block = self._policy.get(key)
-        if block is None or not block.is_ready:
+        if block is None:
             self.pin_failures += 1
+            # Probe the policy's internals to see if the key is there
+            # at all under a different form (sanity check for key
+            # encoding bugs).
+            policy_size = 0
+            policy_sample = []
+            try:
+                # CachePolicy doesn't expose an iterator, but its
+                # underlying dict/OrderedDict is `_blocks` for LRU.
+                inner = getattr(self._policy, "blocks", None)
+                if inner is not None:
+                    policy_size = len(inner)
+                    policy_sample = list(inner.keys())[:3]
+            except Exception:
+                pass
+            logger.warning(
+                "RemoteG2: pin_failed for hash=%d cause=policy_missing_block "
+                "(key_len=%d, key_prefix=%r, policy_size=%d, sample_key=%r)",
+                int(block_hash_int),
+                len(key) if isinstance(key, (bytes, bytearray)) else -1,
+                key[:16] if isinstance(key, (bytes, bytearray)) else key,
+                policy_size,
+                policy_sample[0] if policy_sample else None,
+            )
+            return False
+        if not block.is_ready:
+            self.pin_failures += 1
+            logger.warning(
+                "RemoteG2: pin_failed for hash=%d cause=block_not_ready "
+                "(ref_cnt=%d, block_id=%d)",
+                int(block_hash_int),
+                block.ref_cnt,
+                block.block_id,
+            )
             return False
         block.ref_cnt += 1
         self.pin_count_total += 1
