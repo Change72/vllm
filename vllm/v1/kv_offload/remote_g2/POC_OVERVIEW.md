@@ -219,8 +219,9 @@ docker run -d --name kvp2p-demo --network=host --gpus all \
   --entrypoint sleep <DEV_IMAGE> infinity
 ```
 
-Inside the container, install the modified vLLM editable and the
-matching Dynamo:
+#### 2.3.1 Install vLLM editable
+
+Inside the container:
 
 ```bash
 docker exec kvp2p-demo bash -c '
@@ -229,16 +230,63 @@ docker exec kvp2p-demo bash -c '
     VLLM_VERSION_OVERRIDE=0.20.0+local \
     VLLM_USE_PRECOMPILED=1 \
     pip install -e . --no-deps --no-build-isolation
-  cd /work/dynamo && pip install -e .
 '
 ```
 
-If you want a vanilla deployment with the prebuilt Dynamo runtime
-that does **not** yet include the Router-side plan emission (because
-`oandreeva-kv-p2p-v1-followups` has not landed on main), you can still
-exercise the end-to-end path using the Python plan-injection shim
-described in §2.7. The shim is a single 200-line file plus a
-2-function patch on `dynamo/vllm/handlers.py`.
+#### 2.3.2 Install Dynamo: choose one of two paths
+
+**Path 2.3.2(a) — Prebuilt Dynamo from PyPI (fast, no Rust toolchain).**
+This is what we used during M5 verification. It works for everything
+**except** native Router plan emission; you will need the shim
+described in §2.7 to inject plans on the Python side.
+
+```bash
+docker exec kvp2p-demo pip install ai-dynamo
+```
+
+**Path 2.3.2(b) — Source build of our Dynamo branch (slower, needs
+several system packages; gives you native Router plan emission).**
+This rebuilds the Rust crates that include `lib/kv-router/src/remote_g2_plan.rs`,
+producing a `dynamo._core` that emits `extra_args["remote_kv_reuse_plan"]`
+on its own without the shim. **Prerequisites that the source build will
+fail without:**
+
+| Build prerequisite | Why                                    | How                                  |
+| ------------------ | -------------------------------------- | ------------------------------------ |
+| Rust 1.93.1        | `rust-toolchain.toml` in the dynamo workspace pins this version exactly | `curl https://sh.rustup.rs -sSf \| sh -s -- -y --default-toolchain stable; rustup install 1.93.1 --profile minimal` |
+| `protoc` ≥ 25      | `etcd-client` crate compiles `.proto` definitions at build time | Download the Linux release zip from `https://github.com/protocolbuffers/protobuf/releases` and put `protoc` on PATH |
+| `libclang` **with C system headers** | `nixl-sys` crate's `build.rs` uses bindgen to wrap a C wrapper that `#include`s `<stdbool.h>` | `apt-get install libclang-dev libclang-cpp-dev` (the pip `libclang` package alone ships only the shared library, not the system headers, and the build will fail with `'stdbool.h' file not found`) |
+| `pkg-config`, `libssl-dev` (likely) | typical Rust ecosystem build deps | `apt-get install pkg-config libssl-dev` |
+
+Then build and install:
+
+```bash
+docker exec kvp2p-demo bash -c '
+  export PATH=$HOME/.cargo/bin:$PATH
+  export PROTOC=/path/to/protoc
+  export LIBCLANG_PATH=/usr/lib/llvm-XX/lib   # adjust to your llvm version
+  pip install maturin
+  cd /work/dynamo/lib/bindings/python
+  maturin build --release
+  pip install --force-reinstall --no-deps /work/dynamo/target/wheels/ai_dynamo_runtime-*.whl
+  cd /work/dynamo && pip install -e . --no-deps
+'
+```
+
+The dynamo workspace has roughly 800 transitive crates. Expect cargo
+to spend ~30–60 minutes downloading and compiling on first build, even
+on a fast machine. Subsequent rebuilds are incremental.
+
+**Honest note from our verification work**: we did not finish this
+source build on our demo box. After installing Rust 1.93.1 and
+fetching `protoc` from the GitHub release, we hit the libclang
+problem above; the container's `apt-get` was misconfigured (GPG
+signature errors on the Ubuntu mirror), and the pip-shipped libclang
+shared library lacked the system headers that `nixl-sys`'s bindgen
+needs. We did not pursue this further because we already had a
+complete end-to-end verification path via 2.3.2(a) + the shim
+(documented in §4). If you take 2.3.2(b) on a machine with a clean
+apt sources list, the build deps above are what you will need.
 
 ### 2.4 Start NATS + etcd
 
@@ -348,19 +396,21 @@ on which `dynamo.vllm` Python you are running:
 Dynamo's vLLM handler already plumbs `extra_args` through to vLLM's
 `sampling_params.extra_args["kv_transfer_params"]`. Our
 `feat/kv-p2p-vllm-bridge` branch is **based on this followups
-branch**, so a fresh source install of Dynamo following §2.3 (which
-builds the Rust components from source as part of `pip install -e .`)
-includes `remote_g2_plan.rs` and emits plans natively. Nothing
-additional to install in this case.
+branch**, so a source build of Dynamo via path 2.3.2(b) above includes
+`remote_g2_plan.rs` and emits plans natively. Nothing additional to
+install in this case.
 
-Caveat: we have **not** end-to-end verified this path ourselves. Our
-own M5 verification (§4) ran against a prebuilt `ai-dynamo` PyPI
-package built from `main`, which does *not* contain
-`remote_g2_plan.rs`, and we exercised the shim path (b) instead. The
-native path should work for a fresh source install of our branch, but
-you should sanity-check that the Router actually emits the plan
-(grep worker logs for the manager's `RemoteG2: req ... plan ...
-resolved` line; see §4.1) before assuming it.
+Caveat: we have **not** end-to-end verified this path ourselves. We
+attempted the 2.3.2(b) source build on our demo box but were blocked
+on a missing-system-headers issue inside the `nixl-sys` Rust crate
+(see the honest-note in §2.3.2). Our M5 verification (§4) used the
+prebuilt PyPI Dynamo (path 2.3.2(a)) and exercised the shim path (b)
+below. We are confident path (a) works on a clean machine that
+satisfies the 2.3.2(b) build deps, but the verification needs to be
+done on such a machine by either us or you. The check is simple:
+once Dynamo is source-built, grep worker logs for `RemoteG2: req ...
+plan ... resolved` after a request — that confirms the Router emitted
+a plan and the source registry resolved it.
 
 **(b) POC shim — for any environment running a prebuilt Dynamo
 binary that lacks `remote_g2_plan.rs`** (anything based on
@@ -594,7 +644,7 @@ KV as if we had recomputed". Detailed numbers in `FINDINGS.md`.
 | End-to-end output byte equality vs source reference | ✅ verified (two-engine eval) |
 | Dynamo HTTP frontend + KV router → vLLM workers | ✅ working |
 | Plan emission via POC shim (`kvp2p_plan_inject.py`) | ✅ working, what M5 verified |
-| Native plan emission by the Router (`remote_g2_plan.rs`) | included in our Dynamo branch (we are based on `oandreeva-kv-p2p-v1-followups`); ⏳ **not** end-to-end verified by us — needs sanity check on a fresh source install |
+| Native plan emission by the Router (`remote_g2_plan.rs`) | code included in our Dynamo branch (we are based on `oandreeva-kv-p2p-v1-followups`); ⏳ **not** end-to-end verified by us — we attempted the source build per §2.3.2(b) but were blocked on a `nixl-sys` bindgen issue requiring `libclang` system headers our container's broken apt could not supply. Needs verification on a machine that satisfies §2.3.2(b)'s build prerequisites. |
 | Cross-host deployment + UCX device tuning | not yet exercised |
 | Performance benchmarks (TTFT / throughput) | not yet measured |
 | `dp_rank > 0` live | not yet exercised |
