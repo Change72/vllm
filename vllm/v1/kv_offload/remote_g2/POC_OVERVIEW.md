@@ -337,34 +337,53 @@ curl -s http://127.0.0.1:8000/v1/models
 
 ### 2.7 Plan emission
 
-There are two ways to get a `RemoteKvReusePlan` into the request:
+There are two ways to get a `RemoteKvReusePlan` into the request.
+Which one applies to you depends on **how you installed Dynamo**, not
+on which `dynamo.vllm` Python you are running:
 
-**(a) Native — once Olga's followups branch is on dynamo main.** The
-Router emits `extra_args["remote_kv_reuse_plan"]` on selected
-requests; Dynamo's vLLM handler is already plumbing `extra_args` into
-vLLM's `sampling_params.extra_args["kv_transfer_params"]`. Nothing
-additional to install.
+**(a) Native — Router emits the plan.** Olga's
+`oandreeva-kv-p2p-v1-followups` branch on `ai-dynamo/dynamo` adds
+`lib/kv-router/src/remote_g2_plan.rs`, which makes the KV Router emit
+`extra_args["remote_kv_reuse_plan"]` on selected routing decisions.
+Dynamo's vLLM handler already plumbs `extra_args` through to vLLM's
+`sampling_params.extra_args["kv_transfer_params"]`. Our
+`feat/kv-p2p-vllm-bridge` branch is **based on this followups
+branch**, so a fresh source install of Dynamo following §2.3 (which
+builds the Rust components from source as part of `pip install -e .`)
+includes `remote_g2_plan.rs` and emits plans natively. Nothing
+additional to install in this case.
 
-**(b) POC shim — for the current prebuilt runtime.** A single Python
-file, `kvp2p_plan_inject.py`, queries each peer's source registry
-stats over the source RPC, builds an "all-hashes" plan, and writes it
-into `sampling_params.extra_args["kv_transfer_params"]
-["remote_g2_plan"]`. Two `build_sampling_params*` helpers in
-`dynamo/vllm/handlers.py` (the non-OpenAI and the OpenAI flavors)
-each receive a six-line patch at their return site that calls
+Caveat: we have **not** end-to-end verified this path ourselves. Our
+own M5 verification (§4) ran against a prebuilt `ai-dynamo` PyPI
+package built from `main`, which does *not* contain
+`remote_g2_plan.rs`, and we exercised the shim path (b) instead. The
+native path should work for a fresh source install of our branch, but
+you should sanity-check that the Router actually emits the plan
+(grep worker logs for the manager's `RemoteG2: req ... plan ...
+resolved` line; see §4.1) before assuming it.
+
+**(b) POC shim — for any environment running a prebuilt Dynamo
+binary that lacks `remote_g2_plan.rs`** (anything based on
+`ai-dynamo/dynamo:main` as of 2026-06: PyPI wheels, prebuilt
+containers, etc.). A single Python file, `kvp2p_plan_inject.py`,
+queries each peer's source registry stats over the source RPC,
+builds an "all-hashes" plan, and writes it into
+`sampling_params.extra_args["kv_transfer_params"]["remote_g2_plan"]`.
+Two `build_sampling_params*` helpers in `dynamo/vllm/handlers.py`
+(the non-OpenAI and the OpenAI flavors) each receive a six-line
+patch at their return site that calls
 `maybe_inject_plan(sampling_params, ...)` inside a try/except.
 
-The all-hashes plan is correctness-preserving because the
-vLLM-side manager intersects the plan's hashes with the current
-request's per-block hashes — only the intersection triggers a NIXL
-READ. The shim raises the wire cost (one stats RPC per request, plus
-a larger plan) but produces the same load decisions as a precise
+The all-hashes plan is correctness-preserving because the vLLM-side
+manager intersects the plan's hashes with the current request's
+per-block hashes — only the intersection triggers a NIXL READ. The
+shim raises the wire cost (one stats RPC per request, plus a larger
+plan) but produces the same load decisions as a precise
 Router-emitted plan.
 
-The shim file is published with the PoC artifacts; its own docstring
-explains the protocol. Removal once (a) is available: delete the
-file, revert the two patches, drop the `KVP2P_PEER_SOCKETS` env var
-from the launcher.
+Removal once you have native path (a): delete `kvp2p_plan_inject.py`,
+revert the two `handlers.py` patches, and drop the
+`KVP2P_PEER_SOCKETS` env var from the launcher.
 
 ### 2.8 Send a request
 
@@ -498,7 +517,8 @@ Unit-test surface:
 | NIXL failure → vLLM `recompute` policy | ✅ working |
 | End-to-end output byte equality vs source reference | ✅ verified (two-engine eval) |
 | Dynamo HTTP frontend + KV router → vLLM workers | ✅ working |
-| Plan emission from Router itself | ⏳ depends on Olga's followups branch being merged; shim covers it today |
+| Plan emission via POC shim (`kvp2p_plan_inject.py`) | ✅ working, what M5 verified |
+| Native plan emission by the Router (`remote_g2_plan.rs`) | included in our Dynamo branch (we are based on `oandreeva-kv-p2p-v1-followups`); ⏳ **not** end-to-end verified by us — needs sanity check on a fresh source install |
 | Cross-host deployment + UCX device tuning | not yet exercised |
 | Performance benchmarks (TTFT / throughput) | not yet measured |
 | `dp_rank > 0` live | not yet exercised |

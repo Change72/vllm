@@ -295,15 +295,28 @@ same Rust Router shim**; no protocol divergence found.
 
 ## 7. Migration path: Router-emitted plans
 
-Today, the prebuilt Dynamo runtime (`dynamo:vllm-kvbm-v2-fix1`) is
-built from `main` and does **not** include `remote_g2_plan.rs`. To
-verify the end-to-end path against the real runtime, we run a
-**Python-side plan-injection shim** (`kvp2p_plan_inject.py`) patched
-into `dynamo/vllm/handlers.py`. See `POC_OVERVIEW.md` §2.7 for the
-shim's wire shape and removal path.
+Our Dynamo branch (`feat/kv-p2p-vllm-bridge`) is based on
+`oandreeva-kv-p2p-v1-followups`, so the Rust Router code
+(`lib/kv-router/src/remote_g2_plan.rs`) that emits
+`extra_args["remote_kv_reuse_plan"]` is **already present** for
+anyone installing Dynamo from source on our branch. In that
+configuration the vLLM-side manager receives plans natively and the
+shim below is not needed.
 
-When `oandreeva-kv-p2p-v1-followups` is merged to `main`:
-1. Router will emit `extra_args["remote_kv_reuse_plan"]` natively.
+However, prebuilt Dynamo runtimes that are built from
+`ai-dynamo/dynamo:main` (PyPI wheels, the prebuilt
+`dynamo:vllm-kvbm-v2-fix1` container we used during M5 verification,
+etc.) do **not** include `remote_g2_plan.rs` yet. To verify the
+end-to-end path against those runtimes — and that was the
+configuration M5 actually ran in — we use a Python-side
+plan-injection shim (`kvp2p_plan_inject.py`) patched into
+`dynamo/vllm/handlers.py`. See `POC_OVERVIEW.md` §2.7 for the shim's
+wire shape and removal path.
+
+When `oandreeva-kv-p2p-v1-followups` is merged to `main` (so the
+prebuilt artifacts pick it up):
+1. Router emits `extra_args["remote_kv_reuse_plan"]` natively in
+   every artifact, not just source builds of our branch.
 2. dynamo.vllm `handlers.py` already plumbs `extra_args` through to
    vLLM — only the key name needs to match what our manager looks
    for. **Pre-coordinated to be `"remote_kv_reuse_plan"` (top-level
