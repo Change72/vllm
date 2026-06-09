@@ -120,6 +120,16 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         # scheduler's populated policy is what the source RPC sees
         # when it pins blocks for an inbound lease.
         self.registry.set_policy(self._policy)
+        # Override the medium label on BlockStored / BlockRemoved events so the
+        # Dynamo Router classifies our blocks as host-pinned. The inherited
+        # CPUOffloadingManager publishes ``self.medium = "CPU"`` (from
+        # ``CPULoadStoreSpec.medium()``), but the Rust KV router only
+        # recognises ``"CPU_PINNED"`` / ``"CPU_TIER1"`` as the host-pinned
+        # tier via ``StorageTier::from_kv_medium``. Without this override the
+        # Router's per-worker ``host_pinned blocks`` count stays 0 and
+        # ``select_remote_g2_reuse_plan`` never proposes a plan even when our
+        # workers have published descriptors.
+        self.medium = "CPU_PINNED"
         # Keep these on the manager for reset_cache /tear-down only —
         # the registry holds the authoritative pool layout.
         self._tier = tier
