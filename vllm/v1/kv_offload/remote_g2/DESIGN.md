@@ -240,6 +240,30 @@ case, the worker behaves like a vanilla `CPUOffloadingSpec`.
   `pin_failed`/`missing`/`wrong_owner` reasons returned in the
   per-block status; target drops the affected suffix.
 
+### 4.7 Interaction with the GPU prefix cache (verification-time only)
+
+`RemoteG2OffloadingManager.lookup` (the entry point that calls
+`_peek_plan`) is invoked by the v1 scheduler only for token ranges
+that are **not already covered by the GPU prefix cache**. Concretely,
+the scheduler computes the GPU prefix-cache prefix length first,
+then asks the offloading connector to look up the *suffix*. If the
+prefix cache covers the entire request, the connector is never
+called and `_peek_plan` therefore never sees the plan that was
+injected into `extra_args`.
+
+In production this is the correct behaviour — a GPU hit is strictly
+faster than a cross-host NIXL pull, so taking it is the right
+decision. But it does mean that any verification workload that
+sends the *same* prompt twice into a worker with prefix caching on
+will see `plan_seen_count = 0` on the second hit even though the
+plan reached the request: the connector's `lookup` was simply not
+called. The launcher script in `POC_OVERVIEW.md` §2.5 therefore sets
+`--no-enable-prefix-caching` and `--gpu-memory-utilization 0.2`
+paired with a 16 GiB `cpu_bytes_to_use`, so every request is forced
+through the CPU/Remote tier and the connector observes the plan
+deterministically. Production deployments should leave prefix
+caching enabled; this knob is purely a verification artefact.
+
 ## 5. Wire protocol
 
 ZMQ REP socket bound at `ipc://<source_rpc_socket_path>`. Each request
@@ -323,8 +347,17 @@ prebuilt artifacts pick it up):
    in `extra_args`) on the Router side, mapped to
    `kv_transfer_params["remote_g2_plan"]` on the vLLM side**, exactly
    what handlers.py already does for prefill/decode disagg.
-3. Delete `kvp2p_plan_inject.py` and the `_kvp2p_inject(...)` call in
-   `handlers.py`. No vLLM-side code changes required.
+3. The shim (`kvp2p_plan_inject.py` + the `_kvp2p_inject(...)` call
+   in `handlers.py`) is no longer required for the production path
+   and may be removed. We recommend keeping it in-tree under
+   `components/src/dynamo/vllm/kv_p2p/` as a verification tool: it
+   forces a known, deterministic plan into `extra_args` independent
+   of the Router's reuse predicate, which is the only way to
+   exercise the source-RPC + NIXL data plane in single-host or
+   co-located topologies (where the predicate intentionally
+   declines to emit). Gate it behind an env var so it does not run
+   unless explicitly requested. No vLLM-side code changes required
+   either way.
 
 ## 8. Open coordination items with HQ
 

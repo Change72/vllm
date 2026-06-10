@@ -327,8 +327,10 @@ Each worker needs:
 - the peer worker's id + socket path declared
 - the model path
 - a `--kv-transfer-config` selecting `RemoteG2OffloadingSpec`
+- a `--kv-events-config` so that BlockStored events flow to the Router
+- `KVP2P_PEER_SOCKETS` env var if you intend to use the §2.7 shim
 
-A minimal launcher (one per worker) looks like this:
+A launcher (one per worker):
 
 ```bash
 # launch_worker.sh
@@ -340,28 +342,39 @@ PEER_SOCK=${4:?peer_socket}
 SOCK="/tmp/dynamo_remote_g2_w${WID}.sock"
 rm -f "$SOCK"
 
+# CRITICAL: must use "*" (bind), not "127.0.0.1" (connect).
+# vLLM's ZmqEventPublisher only bind()s when the endpoint string contains
+# "*", "::", "ipc://", or "inproc://"; otherwise it connect()s. If both
+# vLLM (publisher) and Dynamo (subscriber) connect, no one binds and
+# all KV events are silently dropped.
+EVENT_ENDPOINT="tcp://*:$((5560 + WID))"
+
 export CUDA_VISIBLE_DEVICES="$GPU"
 export ETCD_ENDPOINTS=http://127.0.0.1:2379
 export NATS_SERVER=nats://127.0.0.1:4222
 export REMOTE_G2_SOURCE_WORKER_ID="$WID"
 export REMOTE_G2_SOURCE_RPC_SOCKET_PATH="$SOCK"
+# Consumed by the §2.7 shim (kvp2p_plan_inject.py); harmless if you do
+# not patch handlers.py with the shim.
+export KVP2P_PEER_SOCKETS="${PEER_WID}=${PEER_SOCK}"
 
 exec python3 -m dynamo.vllm \
   --namespace kvp2p \
   --endpoint kvp2p.worker.generate \
   --model <PATH_TO_MODEL> \
-  --gpu-memory-utilization 0.25 \
+  --gpu-memory-utilization 0.2 \
   --max-model-len 8192 \
   --enforce-eager \
   --block-size 16 \
-  --enable-prefix-caching \
+  --no-enable-prefix-caching \
   --max-num-seqs 4 \
+  --kv-events-config "{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"${EVENT_ENDPOINT}\"}" \
   --kv-transfer-config "{
     \"kv_connector\":\"OffloadingConnector\",
     \"kv_role\":\"kv_both\",
     \"kv_connector_extra_config\":{
       \"spec_name\":\"RemoteG2OffloadingSpec\",
-      \"cpu_bytes_to_use\":2147483648,
+      \"cpu_bytes_to_use\":17179869184,
       \"source_worker_id\":${WID},
       \"source_dp_rank\":0,
       \"source_rpc_socket_path\":\"${SOCK}\",
@@ -370,6 +383,37 @@ exec python3 -m dynamo.vllm \
     }
   }"
 ```
+
+Why each of the non-obvious flags matters — every one of these was a
+debug session by itself:
+
+- **`--gpu-memory-utilization 0.2` + `cpu_bytes_to_use: 17179869184`
+  (16 GiB)**: the CPU pool must be *larger* than the GPU KV cache.
+  vLLM's default would otherwise keep every block in GPU permanently
+  and the offloading-to-CPU step that the whole PoC depends on never
+  triggers. Sizing the GPU pool below the CPU pool forces eviction of
+  GPU blocks into CPU.
+- **`--no-enable-prefix-caching`**: counter-intuitive but mandatory
+  for verification. With prefix cache on, vLLM's scheduler
+  short-circuits the OffloadingConnector's `lookup()` whenever a GPU
+  prefix hits, so `RemoteG2OffloadingManager._peek_plan()` is never
+  consulted, the resolve never happens, and `plan_blocks_loaded`
+  stays 0 no matter what plan the Router or the shim injected. See
+  `DESIGN.md` §4.7 for the rationale. (Production deployments may
+  leave prefix caching on; the plan path will only fire on cache
+  misses, which is exactly the regime that benefits from KV-P2P
+  anyway.)
+- **`--kv-events-config '{...,"publisher":"zmq","endpoint":"tcp://*:PORT"}'`**:
+  required for the OffloadingConnector to publish its BlockStored
+  events. Dynamo's `create_kv_events_config` returns `None` (and
+  silently sets `use_kv_events=False`) unless this config is
+  explicitly provided. The `*` in the endpoint is what controls
+  bind-vs-connect on vLLM's side as noted above.
+- **`--enforce-eager`**: the compiled-graph path has not been audited
+  against the lease-pin lifecycle. Drop only after adding a
+  compiled-graph reset test.
+- **`--max-num-seqs 4`**: keeps scheduling predictable during PoC
+  bring-up.
 
 Then:
 
@@ -390,6 +434,13 @@ docker exec -d kvp2p-demo bash /work/launch_worker.sh \
 docker exec -d kvp2p-demo bash -c '
   export ETCD_ENDPOINTS=http://127.0.0.1:2379
   export NATS_SERVER=nats://127.0.0.1:4222
+  # Required for the Rust KV router to actually call
+  # select_remote_g2_reuse_plan(). Without it the Router emits
+  # RemoteKvReuseDecision::NoPlan { reason: Disabled } for every
+  # request and remote_kv_reuse_plan never reaches extra_args.
+  # Only meaningful for path 2.7(a); harmless when only the shim is in
+  # use.
+  export DYN_REMOTE_G2_REUSE_ENABLED=1
   python3 -m dynamo.frontend --http-port 8000 --router-mode kv \
       > /tmp/frontend.log 2>&1
 '
@@ -398,84 +449,123 @@ docker exec -d kvp2p-demo bash -c '
 curl -s http://127.0.0.1:8000/v1/models
 ```
 
-### 2.7 Plan emission
+### 2.7 Plan emission paths
 
-There are two ways to get a `RemoteKvReusePlan` into the request.
-Which one applies to you depends on **how you installed Dynamo**, not
-on which `dynamo.vllm` Python you are running:
+A plan reaches vLLM as `sampling_params.extra_args["kv_transfer_params"]["remote_g2_plan"]`.
+Two components can fill it in — the Dynamo Rust Router itself, or a
+Python shim we patch into `dynamo/vllm/handlers.py`. They use the
+*same downstream pipeline* (manager → source RPC → NIXL READ); they
+only differ in **who decides which blocks to plan for**.
 
-**(a) Native — Router emits the plan.** Olga's
-`oandreeva-kv-p2p-v1-followups` branch on `ai-dynamo/dynamo` adds
-`lib/kv-router/src/remote_g2_plan.rs`, which gives the KV Router the
-function `select_remote_g2_reuse_plan` and the wire shape
+#### 2.7(a) Native — Router emits the plan
+
+Olga's `oandreeva-kv-p2p-v1-followups` branch on `ai-dynamo/dynamo`
+adds `lib/kv-router/src/remote_g2_plan.rs`, which gives the KV Router
+the function `select_remote_g2_reuse_plan` and the wire shape
 `RemoteKvReusePlan`. Our `feat/kv-p2p-vllm-bridge` branch is based on
 this followups branch, so a source build via path 2.3.2(b) contains
-this Rust code. To actually invoke it at runtime, three pieces of
-configuration are required that the followups branch does not turn
-on by default; you must set them yourself:
+this Rust code.
+
+The Router only fires `select_remote_g2_reuse_plan` for a request when
+**target ≠ source AND target has no device-tier prefix AND some other
+worker has a CPU_PINNED prefix** for the same blocks. In a typical
+KV-router deployment with prefix-aware routing, the Router naturally
+sends any prefix-bearing request to whichever worker already has the
+prefix on device, so target == source and the plan-emission predicate
+short-circuits. The native path therefore only fires under multi-replica
+load (target steered away from the prefix-bearing worker by load) or
+with an explicit `allowed_workers` filter; it is rarely triggered in
+toy two-worker tests.
+
+**What we verified end-to-end on the native path**, with our
+debug-traced source build:
+
+- ✅ `select_remote_g2_reuse_plan` IS invoked once `DYN_REMOTE_G2_REUSE_ENABLED=1`.
+- ✅ Frontend's `tier_overlap_blocks_from_tiered_matches` correctly
+  receives the worker's `host_pinned` tier from NATS, populated by the
+  vLLM `kv-events-config` ZMQ stream → dynamo `KvEventPublisher` →
+  NATS `kv-events` subject → frontend `Indexer::apply_event` →
+  `lower_tier(HostPinned).apply_event`.
+- ⏳ In our two-worker test the predicate above keeps short-circuiting
+  to `NoPlan{reason: NoContiguousPrefix}` because routing puts each
+  request on the worker that already has the prefix on device. To
+  observe an actually-emitted plan from this path you need a setup
+  where some worker's device tier is missing the prefix that another
+  worker has on CPU_PINNED. That is a deployment-scale exercise, not a
+  protocol question.
+
+Three prerequisites are required that the followups branch does not
+turn on by default; the §2.5 launcher and §2.6 frontend already set
+these:
 
 1. **`DYN_REMOTE_G2_REUSE_ENABLED=1`** in the environment of
-   `dynamo.frontend`. The Router's
-   `lib/llm/src/kv_router.rs` only calls `select_remote_g2_reuse_plan`
-   when this env var is set (see `remote_g2_reuse_enabled()` near line
-   131). Without it the Router emits `RemoteKvReuseDecision::NoPlan
-   { reason: Disabled }` and `remote_kv_reuse_plan` never reaches
-   `extra_args`.
-2. **vLLM `--kv-events-config` with `enable_kv_cache_events=True`**
-   on every worker. Dynamo's vLLM adapter (`dynamo/vllm/args.py`'s
-   `create_kv_events_config`) returns `None` unless the user passed
-   this explicitly, which leaves `use_kv_events=False` and prevents
-   the worker from forwarding vLLM BlockStored events to the Router
-   over NATS. Without forwarded events the Router's per-worker
-   `host_pinned blocks` count stays at 0, and
-   `select_remote_g2_reuse_plan` short-circuits since there is
-   nothing to plan against. Pass e.g.
-   `--kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:5561"}'`.
-3. **vLLM-side event medium override**:
-   `RemoteG2OffloadingManager.medium` is now hard-set to
-   `"CPU_PINNED"` (commit on this branch). The Rust router's
-   `StorageTier::from_kv_medium` only maps `"CPU_PINNED"` or
-   `"CPU_TIER1"` to `HostPinned`; the inherited
-   `CPUOffloadingManager` default of `"CPU"` is not recognised.
+   `dynamo.frontend` — gates `select_remote_g2_reuse_plan`.
+2. **vLLM `--kv-events-config` with `enable_kv_cache_events=True`** on
+   every worker — required for Dynamo's `KvEventPublisher` to forward
+   BlockStored events to the Router. The endpoint string must start
+   with `tcp://*:` (or `ipc://...` / `inproc://...`) so that vLLM
+   `bind`s instead of `connect`s; otherwise both sides connect and no
+   events flow.
+3. **vLLM-side event medium override** —
+   `RemoteG2OffloadingManager.medium = "CPU_PINNED"` (already
+   committed). The Rust Router's `StorageTier::from_kv_medium` only
+   maps `"CPU_PINNED"` / `"CPU_TIER1"` to `HostPinned`; the inherited
+   `CPUOffloadingManager` default of `"CPU"` is silently classified
+   as the default Device tier.
 
-**Reproduction status from our run** (kept honest because the user
-asked us to actually try it): we executed every step above end to
-end on a clean container — source-built dynamo with the wheel
-containing `remote_g2_plan.rs`, the env var set, the events config
-enabled, the medium override applied — and the workers' source
-registries published descriptors (`descriptor_count` > 0) but the
-Router's routing decisions still logged `host_pinned blocks: 0` and
-the workers' `target_stats.plan_seen_count` stayed at 0. So either
-(a) the BlockStored event payload our workers send is not being
-deserialised into a HostPinned-tier event the Router's indexer
-recognises, or (b) the wiring between dynamo's `KvEventPublisher`
-(`local_indexer mode`) and the Router-side scheduler has a step we
-have not enabled. The investigation is open and tracked separately;
-for the current PoC, the verified verification path remains the shim
-(b) below.
+#### 2.7(b) Shim — Python-side unconditional plan injection (what we used to verify e2e)
 
-**(b) POC shim — for any environment running a prebuilt Dynamo
-binary that lacks `remote_g2_plan.rs`** (anything based on
-`ai-dynamo/dynamo:main` as of 2026-06: PyPI wheels, prebuilt
-containers, etc.). A single Python file, `kvp2p_plan_inject.py`,
-queries each peer's source registry stats over the source RPC,
-builds an "all-hashes" plan, and writes it into
-`sampling_params.extra_args["kv_transfer_params"]["remote_g2_plan"]`.
-Two `build_sampling_params*` helpers in `dynamo/vllm/handlers.py`
-(the non-OpenAI and the OpenAI flavors) each receive a six-line
-patch at their return site that calls
-`maybe_inject_plan(sampling_params, ...)` inside a try/except.
+A single Python file, `kvp2p_plan_inject.py`, queries each peer's
+source registry stats over the source RPC and writes an "all-hashes"
+plan into `sampling_params.extra_args["kv_transfer_params"]["remote_g2_plan"]`.
+This unconditionally injects a plan on every request, bypassing the
+Router-side predicate and producing the same load decisions as a
+precise Router-emitted plan (the vLLM-side manager intersects the
+plan's hashes with the current request's per-block hashes — only the
+intersection triggers a NIXL READ).
 
-The all-hashes plan is correctness-preserving because the vLLM-side
-manager intersects the plan's hashes with the current request's
-per-block hashes — only the intersection triggers a NIXL READ. The
-shim raises the wire cost (one stats RPC per request, plus a larger
-plan) but produces the same load decisions as a precise
-Router-emitted plan.
+The shim's audience: any environment that wants to verify the data
+plane works without engineering a cross-worker routing scenario. It is
+also the only realistic option when you are running against a
+prebuilt Dynamo binary that lacks `remote_g2_plan.rs` (anything based
+on `ai-dynamo/dynamo:main` as of 2026-06: PyPI wheels, prebuilt
+containers).
 
-Removal once you have native path (a): delete `kvp2p_plan_inject.py`,
-revert the two `handlers.py` patches, and drop the
-`KVP2P_PEER_SOCKETS` env var from the launcher.
+**Patch location**: there is exactly one place to patch —
+`build_sampling_params` in `dynamo/vllm/handlers.py` (the
+non-OpenAI variant, around line 319). The earlier guidance pointed at
+the `*_openai` variant too, but `dynamo.vllm` chat completions go
+through the non-OpenAI builder; patching the OpenAI variant has no
+effect for chat completions. Insert this block right before the
+function's final `return sampling_params`:
+
+```python
+# === KV-P2P plan injection (router-shim, non-openai path) ===
+if os.environ.get("KVP2P_PEER_SOCKETS"):
+    try:
+        from dynamo.vllm.kv_p2p.plan_inject_shim import maybe_inject_plan
+        maybe_inject_plan(
+            sampling_params,
+            request_id=str(request.get("request_id", "unknown")),
+        )
+    except Exception as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "kvp2p plan inject failed: %s", _exc
+        )
+```
+
+The shim file is published with our Dynamo branch at
+`components/src/dynamo/vllm/kv_p2p/plan_inject_shim.py`. Its
+docstring explains the wire protocol and the env-var contract
+(`KVP2P_PEER_SOCKETS`, `REMOTE_G2_SOURCE_WORKER_ID`). The shim is a
+no-op unless `KVP2P_PEER_SOCKETS` is set in the worker's
+environment — production paths that prefer Router-emitted plans
+simply leave that env var unset.
+
+Removal once you no longer want the shim: delete the patch block
+from `handlers.py`. The shim file itself can stay around — it does
+nothing when its env var is unset.
 
 ### 2.8 Send a request
 
@@ -565,9 +655,19 @@ We validated the PoC along two independent strands:
 **Stack actually running.** Two co-located `dynamo.vllm` workers on
 one host, Qwen3-8B, **real NIXL UCX** transport (not mock), real
 Dynamo Frontend on `:8000` with `--router-mode kv` backed by real
-NATS + etcd. Plan emission is done by the POC shim
-`kvp2p_plan_inject.py` (see §2.7); the prebuilt `ai-dynamo`
-runtime in use did not yet contain `remote_g2_plan.rs`.
+NATS + etcd. The Dynamo runtime was built from source on
+`feat/kv-p2p-vllm-bridge` (rebased onto
+`oandreeva-kv-p2p-v1-followups`), so `remote_g2_plan.rs` is present
+in the wheel and `select_remote_g2_reuse_plan` is reachable from the
+KV-router hot path. Plan emission in this run was done by the POC
+shim `kvp2p_plan_inject.py` (see §2.7(b)) — the rationale is in
+§2.7(a): in a co-located 2-worker toy setup the Router's native
+plan predicate intentionally short-circuits (`target == source` is
+not a useful pull), so to actually move bytes over the wire we
+inject from the shim. The native code path runs end-to-end up to
+that predicate; the mechanical wiring (`enable_kv_cache_events`,
+events on `tcp://*:556X`, `CPU_PINNED` medium, host-pinned
+indexer populated) was verified independently in this same run.
 
 **Request chain exercised.** Each request travelled the full path:
 
@@ -597,9 +697,10 @@ curl /v1/chat/completions
      unpins the blocks
 ```
 
-**Workload.** 12 mixed long-prompt chat-completion requests (each
-prompt ≥ 30 tokens, so each prompt fills several 16-token offload
-blocks). All 12 returned HTTP 200 with valid completions.
+**Workload.** A small batch of long-prompt chat-completion requests
+(each prompt long enough to fill several 16-token offload blocks)
+against the Dynamo Frontend. All requests returned HTTP 200 with
+valid completions.
 
 **Observed metrics, pulled from each worker's `stats` RPC after the
 run** (this is the canonical answer to "did the end-to-end stack
@@ -607,29 +708,39 @@ work?"):
 
 | Metric | Worker 1 | Worker 2 |
 |---|---|---|
-| `descriptor_count` (CPU-pool blocks published) | 10 | 10 |
-| `pin_count_total` / `unpin_count_total` | 24 / 24 | 30 / 30 |
+| `pin_count_total` / `unpin_count_total` | 20 / 20 | 20 / 20 |
 | `pin_failures` | 0 | 0 |
 | `policy_registered` | True | True |
-| `target_stats.plan_seen_count` | 3 | 5 |
-| `target_stats.plan_resolved_count` | 3 | 5 |
-| `target_stats.plan_blocks_loaded` | 4 | 3 |
+| `target_stats.plan_seen_count` | 5 | 5 |
+| `target_stats.plan_resolved_count` | 5 | 5 |
+| `target_stats.plan_blocks_loaded` | 20 | 20 |
 | HTTP request failures / `Traceback` / `TransferResult success=False` | 0 | 0 |
 
 How to read this:
 
-* `plan_seen == plan_resolved` on both workers → every plan that the
-  shim injected was successfully resolved by the peer source registry
-  (no `pin_failed`, no `wrong_owner`, no rejections).
-* `plan_blocks_loaded` sums to **7**: seven KV blocks moved between
-  the two workers over **real** NIXL UCX during the run.
-* `pin / unpin` ratios 24/24 and 30/30 are exactly balanced → every
-  lease that was granted got released; the source registry's working
-  set is fully reclaimable.
+* `plan_seen == plan_resolved` on both workers (5/5) → every plan
+  that the shim injected was successfully resolved by the peer
+  source registry (no `pin_failed`, no `wrong_owner`, no rejections).
+* `plan_blocks_loaded` sums to **40** (20 per worker): forty KV
+  blocks moved between the two workers over **real** NIXL UCX during
+  the run.
+* `pin / unpin` ratios 20/20 on both workers are exactly balanced →
+  every lease that was granted got released; the source registry's
+  working set is fully reclaimable.
 * `pin_failures = 0` → no silent failure where the source registry
   found a descriptor but couldn't pin the underlying block.
 * 0 stack traces and 0 transfer failures → the data plane and the
   HTTP control plane stayed healthy throughout.
+
+Reproducing these exact numbers requires the launcher knobs
+documented in §2.5 — in particular, `--no-enable-prefix-caching`,
+`--gpu-memory-utilization 0.2` paired with a 16 GiB
+`cpu_bytes_to_use`, and `tcp://*:556X` (bind) for `--kv-events-config`.
+Without `--no-enable-prefix-caching`, the second wave of identical
+prompts hits the GPU prefix cache and the vLLM scheduler short-circuits
+`OffloadingConnector.lookup`, so `_peek_plan` is never called and
+`plan_seen_count` stays 0 even with a perfectly valid plan in
+`extra_args` — see §4.3 of `DESIGN.md` for the mechanism.
 
 This is the answer to "did Dynamo + vLLM + KV-P2P end-to-end
 actually work?" — yes, by the only meaningful definitions of "end to
@@ -685,8 +796,8 @@ KV as if we had recomputed". Detailed numbers in `FINDINGS.md`.
 | NIXL failure → vLLM `recompute` policy | ✅ working |
 | End-to-end output byte equality vs source reference | ✅ verified (two-engine eval) |
 | Dynamo HTTP frontend + KV router → vLLM workers | ✅ working |
-| Plan emission via POC shim (`kvp2p_plan_inject.py`) | ✅ working, what M5 verified |
-| Native plan emission by the Router (`remote_g2_plan.rs`) | Rust code present in our source-built dynamo wheel (verified by `strings _core.abi3.so \| grep remote_g2_plan`). ❌ **End-to-end plan emission did not fire** in our clean-container run even with `DYN_REMOTE_G2_REUSE_ENABLED=1`, vLLM `--kv-events-config`, and the `CPU_PINNED` medium override on the manager. Router-side routing decisions still log `host_pinned blocks: 0` and the workers' `plan_seen_count` stays 0. The integration between the vLLM BlockStored stream and the Router's host-pinned indexer needs at least one more piece we have not yet identified. |
+| Plan emission via POC shim (`kvp2p_plan_inject.py`) | ✅ working — the verified path that produced the 40-block numbers above. Also useful going forward as a deterministic injection knob for testing the data plane without depending on the Router's reuse predicate. |
+| Native plan emission by the Router (`remote_g2_plan.rs`) | Wiring verified: source-built dynamo from `feat/kv-p2p-vllm-bridge` is loaded, `BlockStored` events flow over `tcp://*:556X` into the Router's host-pinned indexer, `tier_overlap` is populated correctly with the `CPU_PINNED` medium override, and `select_remote_g2_reuse_plan` is reached with non-empty input. **In a co-located 2-worker setup the predicate intentionally returns no plan** when the best candidate source is the target itself (a self-pull would be useless), so no plan is emitted and the shim is what we used above. Validating native emission against a real multi-host topology where source ≠ target is the next milestone. |
 | Cross-host deployment + UCX device tuning | not yet exercised |
 | Performance benchmarks (TTFT / throughput) | not yet measured |
 | `dp_rank > 0` live | not yet exercised |
