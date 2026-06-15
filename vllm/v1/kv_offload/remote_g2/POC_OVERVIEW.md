@@ -394,15 +394,25 @@ debug session by itself:
   triggers. Sizing the GPU pool below the CPU pool forces eviction of
   GPU blocks into CPU.
 - **`--no-enable-prefix-caching`**: counter-intuitive but mandatory
-  for verification. With prefix cache on, vLLM's scheduler
-  short-circuits the OffloadingConnector's `lookup()` whenever a GPU
-  prefix hits, so `RemoteG2OffloadingManager._peek_plan()` is never
-  consulted, the resolve never happens, and `plan_blocks_loaded`
-  stays 0 no matter what plan the Router or the shim injected. See
-  `DESIGN.md` §4.7 for the rationale. (Production deployments may
-  leave prefix caching on; the plan path will only fire on cache
-  misses, which is exactly the regime that benefits from KV-P2P
-  anyway.)
+  for verification. The v1 scheduler computes the GPU prefix-cache
+  prefix length first, then asks the OffloadingConnector to look up
+  only the *suffix* that the prefix cache didn't cover. So a request
+  whose prefix is fully covered by the GPU prefix cache never reaches
+  `RemoteG2OffloadingManager.lookup()`, `_peek_plan()` is never
+  consulted, and `plan_blocks_loaded` stays 0 no matter what plan the
+  Router or the shim injected. This is the correct production
+  behaviour (a GPU hit is strictly faster than a remote pull), but in
+  a synthetic two-shot verification — same prompt twice — the second
+  shot is a full GPU hit and Remote-G2 is invisible. Disabling prefix
+  caching forces every request through the connector so the data
+  plane can be observed deterministically.
+
+  Composition with prefix caching in production is the partial-hit
+  case: the prefix cache serves `[0, L_gpu)` from GPU; the
+  OffloadingConnector serves `[L_gpu, L_total)` from the plan via
+  NIXL READ. Both run for their respective ranges — there is no
+  short-circuit, and KV-P2P fires exactly on the prefix range that
+  the GPU cache missed, which is the regime that benefits from it.
 - **`--kv-events-config '{...,"publisher":"zmq","endpoint":"tcp://*:PORT"}'`**:
   required for the OffloadingConnector to publish its BlockStored
   events. Dynamo's `create_kv_events_config` returns `None` (and
@@ -491,8 +501,32 @@ debug-traced source build:
   request on the worker that already has the prefix on device. To
   observe an actually-emitted plan from this path you need a setup
   where some worker's device tier is missing the prefix that another
-  worker has on CPU_PINNED. That is a deployment-scale exercise, not a
-  protocol question.
+  worker has on CPU_PINNED.
+
+**Planned reproducer using `x-worker-instance-id`** (to force
+`target ≠ source` in a small topology, without needing a real
+multi-replica deployment):
+
+1. Phase 1 — send a long prompt to worker A without any routing
+   header. A computes prefill, populates its CPU-pinned tier,
+   publishes `BlockStored` events. Confirm via A's source-RPC
+   `stats` endpoint (descriptors present) and via the Frontend's
+   host-pinned indexer (A's worker_id covers the prompt's block
+   hashes).
+2. Phase 2 — send the same prompt to worker B with HTTP header
+   `x-worker-instance-id: <B>`. Dynamo's Frontend honours this
+   header and bypasses prefix-aware routing, forcing the request to
+   B. Now `target=B` has no device-tier prefix but `source=A` has
+   the prefix on CPU_PINNED, so `select_remote_g2_reuse_plan` has a
+   valid candidate.
+3. Confirm at vLLM: B's `target_stats.plan_seen_count` increments
+   and `target_stats.plan_blocks_loaded` reflects a real NIXL pull
+   from A. The plan in `sampling_params.extra_args["kv_transfer_params"]["remote_g2_plan"]`
+   carries `source_worker_id == A`.
+
+This is a co-located, single-host reproducer; the only thing it
+does not validate that a real multi-host deployment would is UCX
+across the network. It is the next item we will add and run.
 
 Three prerequisites are required that the followups branch does not
 turn on by default; the §2.5 launcher and §2.6 frontend already set
@@ -766,7 +800,7 @@ both.
 | `test_e2e_smoke.py` | End-to-end load path with mock-NIXL; sanity-checks framework wiring | 4 | ✅ |
 | `test_lease_pin.py` | Pin/unpin balance, TTL expiry, 8-thread / 500-iter concurrency, 1000-lease stress, no slow leak under mixed full/partial/miss workloads | 9 | ✅ |
 | `test_plan_miss.py` | All rejection reasons from `resolve_and_lease`: full miss, partial-prefix miss, `wrong_source_worker`, `wrong_source_rank`, `unsupported_plan_version`, `plan_expired`, `invalid_plan`, empty plan, post-release cleanliness | 10 | ✅ |
-| `test_failure_recovery.py` | NIXL fault injection (`fault_inject_every` knob): every-Nth READ raises → `TransferResult.success=False` → vLLM scheduler can apply its `kv_load_failure_policy`. Confirms no stuck state across consecutive failures and recoveries. | 7 | ✅ |
+| `test_failure_recovery.py` | NIXL fault injection (`fault_inject_every` knob): every-Nth READ raises → `TransferResult.success=False` → the **manager's** state machine recovers cleanly (lease released, resolve cache cleared, no stuck state across consecutive failures). Note: end-to-end propagation into the scheduler's `kv_load_failure_policy` is blocked by the upstream `assert transfer_result.success` in the offloading worker loop — see §4.3 status. | 7 | ✅ |
 
 **30 / 30 pass.**
 
@@ -792,20 +826,24 @@ KV as if we had recomputed". Detailed numbers in `FINDINGS.md`.
 | Source RPC + plan resolve (cross-worker) | ✅ working |
 | Per-layer (all 36 layers) NIXL READ | ✅ working |
 | Lease pin / unpin / TTL | ✅ working, balanced |
-| Plan-miss / partial-prefix degradation | ✅ working, no leases leaked |
-| NIXL failure → vLLM `recompute` policy | ✅ working |
+| Plan-miss / partial-prefix degradation at the manager state machine | ✅ working, no leases leaked (validated by `test_failure_recovery.py`) |
+| NIXL failure → vLLM `recompute` policy end-to-end | ⚠️ open. Our adapter correctly reports `TransferResult.success=False`, but the upstream offloading worker loop at `vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:273` runs `assert transfer_result.success` before the scheduler's `kv_load_failure_policy` can apply. Tracked as a separate proposal with the offloading-connector owners. |
 | End-to-end output byte equality vs source reference | ✅ verified (two-engine eval) |
 | Dynamo HTTP frontend + KV router → vLLM workers | ✅ working |
 | Plan emission via POC shim (`kvp2p_plan_inject.py`) | ✅ working — the verified path that produced the 40-block numbers above. Also useful going forward as a deterministic injection knob for testing the data plane without depending on the Router's reuse predicate. |
-| Native plan emission by the Router (`remote_g2_plan.rs`) | Wiring verified: source-built dynamo from `feat/kv-p2p-vllm-bridge` is loaded, `BlockStored` events flow over `tcp://*:556X` into the Router's host-pinned indexer, `tier_overlap` is populated correctly with the `CPU_PINNED` medium override, and `select_remote_g2_reuse_plan` is reached with non-empty input. **In a co-located 2-worker setup the predicate intentionally returns no plan** when the best candidate source is the target itself (a self-pull would be useless), so no plan is emitted and the shim is what we used above. Validating native emission against a real multi-host topology where source ≠ target is the next milestone. |
+| Native plan emission by the Router (`remote_g2_plan.rs`) | Wiring verified: source-built dynamo from `feat/kv-p2p-vllm-bridge` is loaded, `BlockStored` events flow over `tcp://*:556X` into the Router's host-pinned indexer, `tier_overlap` is populated correctly with the `CPU_PINNED` medium override, and `select_remote_g2_reuse_plan` is reached with non-empty input. **In a co-located 2-worker setup the predicate intentionally returns no plan** when the best candidate source is the target itself (a self-pull would be useless), so no plan is emitted and the shim is what we used above. Validating native emission against a real multi-host topology where source ≠ target is the next milestone — concrete reproducer is planned using Dynamo's `x-worker-instance-id` header to force `target ≠ source` in a small topology. |
+| Peer-endpoint discovery (target → source RPC) | ⚠️ POC uses static `peer_endpoints` config / `KVP2P_PEER_SOCKETS` env var. `RemoteG2OffloadingSpec.set_peer_endpoint()` is wired for dynamic injection but no discovery layer calls it on this branch. Planned follow-up: a Dynamo-etcd-backed registry that is symmetric across shim and native plan sources. |
+| Mixed local + remote within one load batch | ⚠️ all-or-nothing per batch. `lookup()` composes correctly per-key (local hit precedes plan path), but `prepare_load()` falls back wholesale to the local path if any key in the batch is uncovered by the plan. Loses an opportunity (not correctness); tracked as a follow-up to split into separate `LoadStoreSpec`s. |
+| Tensor parallelism | Single-TP only. `set_pool_layout` is called with `rank=0, num_workers=1`; registry, source RPC server, and NIXL agent are one-instance-per-process. Multi-TP wire shape (per-rank endpoints vs. one fan-out endpoint; per-rank pinned-memory layout) is open design work. |
 | Cross-host deployment + UCX device tuning | not yet exercised |
 | Performance benchmarks (TTFT / throughput) | not yet measured |
 | `dp_rank > 0` live | not yet exercised |
 | Compiled-graph (non eager) | not yet exercised |
 
 The functional path is closed end-to-end; the open items are
-deployment-shape and performance work, not protocol or correctness
-work.
+deployment-shape, multi-rank/multi-TP scaling, and performance work,
+plus the upstream `assert transfer_result.success` gap that has to be
+resolved before failure handling can be claimed end-to-end.
 
 ---
 

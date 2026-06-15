@@ -232,10 +232,22 @@ case, the worker behaves like a vanilla `CPUOffloadingSpec`.
 - Source RPC errors → `TargetG2RpcClient` returns `None` / empty
   result → manager falls through to local compute; request still
   succeeds.
-- NIXL READ failure → `TransferResult.success=False` → vLLM scheduler
-  applies the configured `kv_load_failure_policy` (`fail` or
-  `recompute`). Verified end-to-end via `nixl_adapter.py`'s
-  `fault_inject_every` knob and `tests/.../test_failure_recovery.py`.
+- NIXL READ failure → `TransferResult.success=False`. Our adapter
+  reports this faithfully and the manager's own state machine
+  recovers cleanly (leases released, resolve cache cleared, no
+  stuck state) — validated by `tests/.../test_failure_recovery.py`
+  with the `fault_inject_every` knob.
+
+  Open gap (tracked separately): the upstream offloading worker loop
+  at `vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:273`
+  runs `assert transfer_result.success` before the scheduler's
+  `kv_load_failure_policy` (`fail` / `recompute`) has a chance to
+  apply. A real NIXL fault would therefore crash the worker with
+  AssertionError rather than degrade gracefully. The fix is upstream
+  coordination — replace the assert with a path that surfaces
+  failure to the scheduler, or opt-in failure tolerance per
+  connector. This blocks the "end-to-end recompute on failure"
+  claim, not anything in this connector.
 - Source policy_missing_block / non_live / wrong_owner →
   `pin_failed`/`missing`/`wrong_owner` reasons returned in the
   per-block status; target drops the affected suffix.
