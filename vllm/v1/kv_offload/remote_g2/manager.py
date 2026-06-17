@@ -60,14 +60,27 @@ REMOTE_G2_PLAN_KEY = "remote_g2_plan"
 
 def block_hash_to_router_int(block_hash_bytes: bytes) -> int:
     """Lossy translation from vLLM BlockHash (XXH3-128 / SHA-256 bytes)
-    to a 64-bit int compatible with the Dynamo Router's XXH3-64 keys.
+    to a 64-bit int compatible with what the Dynamo Router observes on
+    the publisher event stream.
 
-    POC: the Router and the source agree on this projection (first 8
-    bytes, big-endian) so plans round-trip correctly. The §3 / §A
-    coordination item with HQ replaces this with the Router-emitted
-    hash carried alongside the vLLM hash on the publisher stream.
+    The projection must match vLLM's ``maybe_convert_block_hash``
+    (vllm/v1/core/kv_cache_utils.py), which is what the Router actually
+    sees on BlockStored events when
+    ``VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=True`` (the default):
+
+        int.from_bytes(hash_bytes, "big") & ((1 << 64) - 1)
+
+    For multi-byte hashes (XXH3-128 → 16 bytes, SHA-256 → 32 bytes),
+    masking the full big-endian integer to 64 bits is equivalent to
+    keeping the **last 8 bytes**, NOT the first 8 bytes. The earlier
+    implementation took the first 8 bytes and therefore produced a
+    different int than what the Router indexer stored for the same
+    block — every native-plan resolve returned ``missing`` because the
+    source's ``_records`` keys and the Router's chain kv_block_hashes
+    were two different projections of the same data.
     """
-    return int.from_bytes(block_hash_bytes[:8], "big", signed=False)
+    full = int.from_bytes(block_hash_bytes, "big", signed=False)
+    return full & ((1 << 64) - 1)
 
 
 class RemoteG2OffloadingManager(CPUOffloadingManager):
@@ -186,6 +199,13 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
     @staticmethod
     def _peek_plan(req_context: ReqContext) -> RemoteKvReusePlan | None:
         params = req_context.kv_transfer_params
+        import logging as _dbgl_pp
+        _dbgl_pp.getLogger(__name__).warning(
+            "DBG_PEEK_PLAN: req_id=%s params_type=%s keys=%s",
+            req_context.req_id,
+            type(params).__name__,
+            list(params.keys()) if isinstance(params, dict) else None,
+        )
         if not params:
             return None
         raw = params.get(REMOTE_G2_PLAN_KEY)
