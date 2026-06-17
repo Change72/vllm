@@ -699,9 +699,17 @@ class SourceG2DescriptorRegistry:
                 record.lease_count += 1
                 pinned_hashes.append(kv_hash)
                 pin_refs.append(pin_ref)
+                # The descriptor's block_hash must be the hash the TARGET
+                # uses to look up its own keys (i.e., the projected vLLM
+                # hash equal to `block_hash_to_router_int(target_key)`),
+                # not the Router's LocalBlockHash identity. The kv_hash
+                # here came from `plan.kv_block_hashes` (chain walk on
+                # the host-pinned indexer) which is exactly that
+                # projection; for the shim path, kv_hash falls back to
+                # identity_hash, so this still works for both sources.
                 descriptors.append(
                     RemoteG2Descriptor(
-                        block_hash=int(identity_hash),
+                        block_hash=int(kv_hash),
                         descriptor_generation=record.descriptor_generation,
                         pool_id=record.pool_id,
                         byte_offset=record.byte_offset,
