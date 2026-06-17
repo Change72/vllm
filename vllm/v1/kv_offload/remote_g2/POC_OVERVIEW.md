@@ -467,70 +467,35 @@ Python shim we patch into `dynamo/vllm/handlers.py`. They use the
 *same downstream pipeline* (manager → source RPC → NIXL READ); they
 only differ in **who decides which blocks to plan for**.
 
-#### 2.7(a) Native — Router emits the plan
+#### 2.7(a) Native — Router emits the plan (verified)
 
 Olga's `oandreeva-kv-p2p-v1-followups` branch on `ai-dynamo/dynamo`
 adds `lib/kv-router/src/remote_g2_plan.rs`, which gives the KV Router
 the function `select_remote_g2_reuse_plan` and the wire shape
 `RemoteKvReusePlan`. Our `feat/kv-p2p-vllm-bridge` branch is based on
-this followups branch, so a source build via path 2.3.2(b) contains
-this Rust code.
+this followups branch and adds the additional fixes needed to drive
+the path end-to-end through the vLLM bridge.
 
-The Router only fires `select_remote_g2_reuse_plan` for a request when
-**target ≠ source AND target has no device-tier prefix AND some other
-worker has a CPU_PINNED prefix** for the same blocks. In a typical
-KV-router deployment with prefix-aware routing, the Router naturally
-sends any prefix-bearing request to whichever worker already has the
-prefix on device, so target == source and the plan-emission predicate
-short-circuits. The native path therefore only fires under multi-replica
-load (target steered away from the prefix-bearing worker by load) or
-with an explicit `allowed_workers` filter; it is rarely triggered in
-toy two-worker tests.
+End-to-end verified on a co-located 2-worker single-host
+reproducer (see §4.1 for the verification numbers): Phase 2's
+request reaches W2 with the Router-attached plan, W2 resolves it
+against W1's source registry, W1 pins all 19 blocks, NIXL UCX pulls
+the bytes, and W2 serves the prompt without writing it to its own
+CPU pool. W1 pin/unpin balances 19/19 with zero failures.
 
-**What we verified end-to-end on the native path**, with our
-debug-traced source build:
+The single-host predicate non-trigger case. The Router's
+`select_remote_g2_reuse_plan` only emits when **target ≠ source AND
+target has no device-tier prefix AND some other worker has a
+CPU_PINNED prefix** for the same blocks. In a typical KV-router
+deployment with prefix-aware routing, the Router naturally sends any
+prefix-bearing request to whichever worker already has the prefix on
+device — so `target == source` and the predicate short-circuits. To
+observe the native path firing in a co-located test, force a
+cross-worker route via Dynamo's `x-worker-instance-id` header (the
+full reproducer is in §2.9 below).
 
-- ✅ `select_remote_g2_reuse_plan` IS invoked once `DYN_REMOTE_G2_REUSE_ENABLED=1`.
-- ✅ Frontend's `tier_overlap_blocks_from_tiered_matches` correctly
-  receives the worker's `host_pinned` tier from NATS, populated by the
-  vLLM `kv-events-config` ZMQ stream → dynamo `KvEventPublisher` →
-  NATS `kv-events` subject → frontend `Indexer::apply_event` →
-  `lower_tier(HostPinned).apply_event`.
-- ⏳ In our two-worker test the predicate above keeps short-circuiting
-  to `NoPlan{reason: NoContiguousPrefix}` because routing puts each
-  request on the worker that already has the prefix on device. To
-  observe an actually-emitted plan from this path you need a setup
-  where some worker's device tier is missing the prefix that another
-  worker has on CPU_PINNED.
-
-**Planned reproducer using `x-worker-instance-id`** (to force
-`target ≠ source` in a small topology, without needing a real
-multi-replica deployment):
-
-1. Phase 1 — send a long prompt to worker A without any routing
-   header. A computes prefill, populates its CPU-pinned tier,
-   publishes `BlockStored` events. Confirm via A's source-RPC
-   `stats` endpoint (descriptors present) and via the Frontend's
-   host-pinned indexer (A's worker_id covers the prompt's block
-   hashes).
-2. Phase 2 — send the same prompt to worker B with HTTP header
-   `x-worker-instance-id: <B>`. Dynamo's Frontend honours this
-   header and bypasses prefix-aware routing, forcing the request to
-   B. Now `target=B` has no device-tier prefix but `source=A` has
-   the prefix on CPU_PINNED, so `select_remote_g2_reuse_plan` has a
-   valid candidate.
-3. Confirm at vLLM: B's `target_stats.plan_seen_count` increments
-   and `target_stats.plan_blocks_loaded` reflects a real NIXL pull
-   from A. The plan in `sampling_params.extra_args["kv_transfer_params"]["remote_g2_plan"]`
-   carries `source_worker_id == A`.
-
-This is a co-located, single-host reproducer; the only thing it
-does not validate that a real multi-host deployment would is UCX
-across the network. It is the next item we will add and run.
-
-Three prerequisites are required that the followups branch does not
-turn on by default; the §2.5 launcher and §2.6 frontend already set
-these:
+Prerequisites required that the followups branch does not turn on by
+default; the §2.5 launcher and §2.6 frontend already set these:
 
 1. **`DYN_REMOTE_G2_REUSE_ENABLED=1`** in the environment of
    `dynamo.frontend` — gates `select_remote_g2_reuse_plan`.
@@ -546,6 +511,59 @@ these:
    maps `"CPU_PINNED"` / `"CPU_TIER1"` to `HostPinned`; the inherited
    `CPUOffloadingManager` default of `"CPU"` is silently classified
    as the default Device tier.
+4. **Prefix caching enabled** on the worker (so KV events flow at
+   all). Dynamo's `create_kv_events_config` short-circuits to
+   "publish nothing" when `enable_prefix_caching=False`, which is
+   the correct production setting anyway. The shim verification in
+   §2.7(b) disables prefix caching to keep its two-shot test
+   deterministic; the native path does not need that knob off because
+   the cross-routing forced via `x-worker-instance-id` is what
+   guarantees the target sees the prompt fresh.
+
+The five fixes the native path needed end-to-end:
+
+- **Dynamo `lower_tier_indexers.rs` — cross-worker host_pinned
+  fallback.** The indexer's per-tier query extends the device chain
+  per worker; a source whose own device tier still covers the
+  prefix reports zero host-pinned hits even when it physically has
+  the blocks. Added a parallel from-root(0) query per tier and
+  merged by max-hits-per-worker. (Patch: `fix(kv-router):
+  cross-worker host_pinned fallback in lower-tier query`.)
+- **Dynamo `remote_g2_plan.rs` — target-anchored plan window.** The
+  plan-emission predicate computed `start = source_device_match`,
+  which collapses to `request_blocks` when the source still holds
+  the prefix on device. Switched to `start = target_device_match`,
+  with a `source_hp_start` term for chains that begin past zero.
+- **Dynamo `handlers.py` — plan adapter.** The Router attaches the
+  plan to `request.extra_args["remote_kv_reuse_plan"]`; vLLM expects
+  `sampling_params.extra_args["kv_transfer_params"]["remote_g2_plan"]`.
+  Added a translator in `build_sampling_params`. The Router's
+  source/target identity is Dynamo's WorkerId (~64-bit lease/instance
+  id); the vLLM source RPC and `peer_endpoints` map use the small
+  integer `REMOTE_G2_SOURCE_WORKER_ID`. Identity-translate at the
+  adapter (2-worker hardcoded for verification; the principled fix
+  is a shared discovery layer per §2 of the cross-framework KV-P2P
+  proposal).
+- **vLLM `manager.py` — hash projection alignment.** The Router
+  observes block hashes as `int.from_bytes(bytes, "big") & ((1<<64)-1)`
+  (vLLM's `maybe_convert_block_hash`), which keeps the **last 8
+  bytes** of multi-byte hashes. The previous
+  `block_hash_to_router_int` took the **first 8 bytes**, so source
+  registry keys and Router-side `kv_block_hashes` were two different
+  projections of the same data — every native-plan resolve returned
+  `missing`. Aligned the projection.
+- **vLLM `data_model.py` — descriptor block_hash uses kv_hash.** The
+  source's `resolve_and_lease` set the descriptor's `block_hash` to
+  the Router's `identity_hash` (XXH3_64 of tokens), which the target
+  side could not match against its own
+  `block_hash_to_router_int(target_key)` lookup. Switched to
+  `kv_hash` (the indexer's chain-walked vLLM projection); the shim
+  path falls back to `identity_hash` automatically when
+  `planned_kv_block_hashes` is empty, so it remains a no-op there.
+
+The first three fixes live on the Dynamo `feat/kv-p2p-vllm-bridge`
+branch; the last two live on the vLLM `feat/kv-p2p-remote-g2`
+branch. Both branches are publicly visible on `linhu-nv`.
 
 #### 2.7(b) Shim — Python-side unconditional plan injection (what we used to verify e2e)
 
@@ -613,6 +631,226 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
     "max_tokens":15
   }'
 ```
+
+### 2.9 End-to-end execution guide: native path with `x-worker-instance-id`
+
+This is the verified end-to-end reproducer for the **native Router
+plan path** in a co-located 2-worker setup. It assumes §2.1–§2.6 are
+already running: source-built Dynamo on `feat/kv-p2p-vllm-bridge`,
+vLLM on `feat/kv-p2p-remote-g2`, two workers up (W1 on GPU 1, W2 on
+GPU 2), Dynamo Frontend on `:8001` with `DYN_REMOTE_G2_REUSE_ENABLED=1`.
+For the native path use the launcher in this section (`launch_worker_xworker.sh`),
+not the §2.5 shim-verification launcher — the differences are
+prefix-caching is ON, `KVP2P_PEER_SOCKETS` is unset, and otherwise
+the flag set is identical.
+
+**Step 1 — verify the launcher does NOT export `KVP2P_PEER_SOCKETS`.**
+The plan adapter in `dynamo.vllm.handlers.build_sampling_params`
+handles the Router-emitted plan unconditionally; the opt-in shim
+hook is gated on `KVP2P_PEER_SOCKETS` being set, so unset it for
+the native run. Use this launcher (saved as
+`/work/launch_worker_xworker.sh` in our test container; the only
+delta vs. §2.5 is `--enable-prefix-caching` and the absence of the
+shim env var):
+
+```bash
+#!/bin/bash
+set -e
+WORKER_ID="${1:?worker_id required}"
+GPU="${2:?gpu required}"
+ENDPOINT="${3:-generate}"
+NAMESPACE="${4:-kvp2p}"
+
+export PYTHONHASHSEED=0
+export CUDA_VISIBLE_DEVICES="$GPU"
+export ETCD_ENDPOINTS="http://127.0.0.1:2379"
+export NATS_SERVER="nats://127.0.0.1:4222"
+export REMOTE_G2_SOURCE_WORKER_ID="$WORKER_ID"
+
+SOCKET="/tmp/dynamo_remote_g2_w${WORKER_ID}.sock"
+rm -f "$SOCKET"
+export REMOTE_G2_SOURCE_RPC_SOCKET_PATH="$SOCKET"
+
+if [ "$WORKER_ID" = "1" ]; then PEER_WID=2; else PEER_WID=1; fi
+PEER_SOCK="/tmp/dynamo_remote_g2_w${PEER_WID}.sock"
+
+# Native path: do NOT export KVP2P_PEER_SOCKETS — the shim must stay
+# dormant so we measure the native Router plan path exclusively.
+unset KVP2P_PEER_SOCKETS
+
+EVENT_ENDPOINT="tcp://*:$((5560 + WORKER_ID))"
+
+exec python3 -m dynamo.vllm \
+  --namespace "$NAMESPACE" \
+  --endpoint "$NAMESPACE.worker.$ENDPOINT" \
+  --model /raid/fly/model/Qwen3-8B \
+  --gpu-memory-utilization 0.2 \
+  --max-model-len 8192 \
+  --enforce-eager \
+  --block-size 16 \
+  --enable-prefix-caching \
+  --max-num-seqs 4 \
+  --kv-events-config "{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"${EVENT_ENDPOINT}\"}" \
+  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"RemoteG2OffloadingSpec\",\"cpu_bytes_to_use\":17179869184,\"source_worker_id\":${WORKER_ID},\"source_dp_rank\":0,\"source_rpc_socket_path\":\"${SOCKET}\",\"use_mock_nixl\":false,\"peer_endpoints\":\"${PEER_WID}=${PEER_SOCK}\"}}"
+```
+
+**Step 2 — discover the Dynamo `worker_instance_id` for each
+worker.** Dynamo's `x-worker-instance-id` header takes the 64-bit
+lease/instance id assigned by Dynamo at registration time, which is
+distinct from the small integer `REMOTE_G2_SOURCE_WORKER_ID` you set
+in the launcher. Read it from etcd, then probe-confirm which is W1
+vs W2 (instance IDs are assigned in startup order, but the safest
+check is empirical):
+
+```bash
+# (a) list instance_id -> tcp port pairs from etcd
+PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python python3 - <<'PY'
+import etcd3, json, re
+c = etcd3.client(host='127.0.0.1', port=2379)
+for v, m in c.get_all():
+    k = m.key.decode()
+    if not k.startswith("v1/instances/kvp2p/worker/generate/"):
+        continue
+    meta = json.loads(v.decode())
+    port = re.match(r"[\d\.]+:(\d+)/", meta["transport"]["tcp"]).group(1)
+    print(meta["instance_id"], "->", port)
+PY
+
+# (b) for each instance_id from (a), send a 1-token probe and watch
+#     which of /work/native_logs/w1.log /work/native_logs/w2.log grows
+#     more. The one that grows more is OUR REMOTE_G2_SOURCE_WORKER_ID
+#     for that instance_id.
+probe() {
+  W1_BEFORE=$(wc -l < /work/native_logs/w1.log)
+  W2_BEFORE=$(wc -l < /work/native_logs/w2.log)
+  curl -s -X POST http://127.0.0.1:8001/v1/completions \
+    -H 'Content-Type: application/json' \
+    -H "x-worker-instance-id: $1" \
+    -d '{"model":"/raid/fly/model/Qwen3-8B","prompt":"hi","max_tokens":2,"temperature":0}' >/dev/null
+  sleep 4
+  W1_INC=$(($(wc -l < /work/native_logs/w1.log) - W1_BEFORE))
+  W2_INC=$(($(wc -l < /work/native_logs/w2.log) - W2_BEFORE))
+  [ "$W1_INC" -gt "$W2_INC" ] && echo "$1 -> W1" || echo "$1 -> W2"
+}
+probe <instance_id_from_(a)_first>
+probe <instance_id_from_(a)_second>
+```
+
+Record the mapping; call the W1 id `$W1_INSTANCE` and the W2 id
+`$W2_INSTANCE` for the rest of this guide.
+
+**Step 3 — Phase 1: warm W1's CPU-pinned tier with the test prompt.**
+Send a long prompt to W1 with `x-worker-instance-id: $W1_INSTANCE`
+so the Frontend routes it directly. W1 will run prefill, offload
+blocks to its CPU-pinned pool, and publish `BlockStored` events on
+both Device (GPU prefix cache) and HostPinned tiers:
+
+```bash
+LONG_PROMPT='You are a careful, friendly senior software engineer reviewing a complex distributed-systems pull request. Below is a long context describing the system architecture: there are two vLLM workers running on the same host, each holding a host-pinned CPU KV cache, connected via NIXL UCX for KV transfer. The router is responsible for deciding which worker should serve each request and whether to inject a Remote-G2 reuse plan that tells the target worker to pull KV blocks from another worker'\''s CPU-pinned tier instead of recomputing prefill. Your job is to summarise this architecture and call out any subtle correctness concerns in the lease lifecycle, the pin/unpin balance, the eviction policy interaction, and the NIXL per-layer transfer shape. Please proceed with the review in three short paragraphs.'
+
+curl -s -X POST http://127.0.0.1:8001/v1/completions \
+  -H 'Content-Type: application/json' \
+  -H "x-worker-instance-id: $W1_INSTANCE" \
+  -d "{\"model\":\"/raid/fly/model/Qwen3-8B\",\"prompt\":\"$LONG_PROMPT $LONG_PROMPT\",\"max_tokens\":10,\"temperature\":0}"
+
+sleep 8   # let BlockStored events settle into the Frontend indexer
+```
+
+Confirm W1's source registry got populated:
+
+```bash
+python3 - <<'PY'
+from vllm.v1.kv_offload.remote_g2.target_client import TargetG2RpcClient
+c = TargetG2RpcClient('/tmp/dynamo_remote_g2_w1.sock', timeout_ms=3000)
+print(c.stats(sample_limit=0))
+c.close()
+PY
+# Expect: descriptor_count: ~19, target_stats.plan_seen_count: 0
+```
+
+**Step 4 — Phase 2: send the same prompt to W2 with
+`x-worker-instance-id: $W2_INSTANCE`.** The Frontend's KV Router
+honours the header and bypasses prefix-aware routing, forcing the
+request to W2. W2 has no device-tier prefix for this prompt
+(W2 has never seen it), and W1 has it on CPU_PINNED — so the
+predicate emits a plan, the adapter copies it into
+`sampling_params.extra_args["kv_transfer_params"]["remote_g2_plan"]`,
+W2's `RemoteG2OffloadingManager.lookup` peeks the plan, calls
+`resolve_and_lease` over ZMQ to W1's source registry, W1 pins all
+19 blocks, descriptors come back, and the per-layer NIXL UCX READ
+moves the bytes to W2's GPU KV slots.
+
+```bash
+curl -s -X POST http://127.0.0.1:8001/v1/completions \
+  -H 'Content-Type: application/json' \
+  -H "x-worker-instance-id: $W2_INSTANCE" \
+  -d "{\"model\":\"/raid/fly/model/Qwen3-8B\",\"prompt\":\"$LONG_PROMPT $LONG_PROMPT\",\"max_tokens\":10,\"temperature\":0}"
+
+sleep 4
+```
+
+**Step 5 — confirm the native path fired end-to-end.** Pull stats
+from both workers and check the canonical metrics:
+
+```bash
+python3 - <<'PY'
+from vllm.v1.kv_offload.remote_g2.target_client import TargetG2RpcClient
+for sock in ('/tmp/dynamo_remote_g2_w1.sock',
+             '/tmp/dynamo_remote_g2_w2.sock'):
+    c = TargetG2RpcClient(sock, timeout_ms=3000)
+    print(sock, c.stats(sample_limit=0))
+    c.close()
+PY
+```
+
+Expected, on a successful native-path run:
+
+| Metric | W1 (source) | W2 (target) |
+|---|---|---|
+| `descriptor_count` | 19 | 0 |
+| `pin_count_total` / `unpin_count_total` | 19 / 19 | 0 / 0 |
+| `pin_failures` | 0 | 0 |
+| `target_stats.plan_seen_count` | 0 | 1 |
+| `target_stats.plan_resolved_count` | 0 | 1 |
+| `target_stats.plan_load_specs_emitted` | 0 | 1 |
+| `target_stats.plan_blocks_loaded` | 0 | 19 |
+
+The W2 `descriptor_count = 0` is the diagnostic to focus on: W2
+served the entire prompt by pulling KV from W1 over NIXL and
+**never wrote the prompt's blocks into its own CPU pool**. The plan
+path completely short-circuited the prefill computation it would
+otherwise have done.
+
+If you also want to see the Router's plan emission in the Frontend
+log:
+
+```bash
+grep -E "PROBE remote_g2_plan|host-pinned tier present" /work/native_logs/frontend.log | tail -5
+```
+
+The `host-pinned tier present` line should report
+`host_pinned_hits={WorkerWithDpRank { worker_id: <W1_INSTANCE>, ... }: 19}`
+and the `PROBE remote_g2_plan kv_block_hash chain` line should show
+19 entries in both `requested_block_hashes` and `chain_kv_block_hashes`.
+
+**Troubleshooting**:
+
+- `plan_seen_count = 0` on W2 after Phase 2: either the Router did
+  not emit (check the Frontend log for `host_pinned_hits` and the
+  `PROBE remote_g2_plan` line), or the plan adapter in
+  `handlers.py` did not run (check the worker log for the
+  `native router plan adapted: ...` info line).
+- `plan_resolved_count = 0` while `plan_seen_count = 1`: identity
+  translation mismatch — check that the launcher sets
+  `REMOTE_G2_SOURCE_WORKER_ID` and that the W1 instance id in the
+  log matches what the adapter saw. The worker log will show
+  `RemoteG2: no peer endpoint registered for worker_id=<dynamo-id>`
+  if the adapter did not translate.
+- `plan_blocks_loaded = 0` while `plan_resolved_count = 1`: hash
+  format mismatch — confirm `block_hash_to_router_int` uses the
+  full-bytes mask (not slice) and that `RemoteG2Descriptor.block_hash`
+  is populated from `kv_hash` (not `identity_hash`). Both fixes are
+  in the vLLM commits referenced in §2.7(a).
 
 ---
 
@@ -831,7 +1069,7 @@ KV as if we had recomputed". Detailed numbers in `FINDINGS.md`.
 | End-to-end output byte equality vs source reference | ✅ verified (two-engine eval) |
 | Dynamo HTTP frontend + KV router → vLLM workers | ✅ working |
 | Plan emission via POC shim (`kvp2p_plan_inject.py`) | ✅ working — the verified path that produced the 40-block numbers above. Also useful going forward as a deterministic injection knob for testing the data plane without depending on the Router's reuse predicate. |
-| Native plan emission by the Router (`remote_g2_plan.rs`) | Wiring verified: source-built dynamo from `feat/kv-p2p-vllm-bridge` is loaded, `BlockStored` events flow over `tcp://*:556X` into the Router's host-pinned indexer, `tier_overlap` is populated correctly with the `CPU_PINNED` medium override, and `select_remote_g2_reuse_plan` is reached with non-empty input. **In a co-located 2-worker setup the predicate intentionally returns no plan** when the best candidate source is the target itself (a self-pull would be useless), so no plan is emitted and the shim is what we used above. Validating native emission against a real multi-host topology where source ≠ target is the next milestone — concrete reproducer is planned using Dynamo's `x-worker-instance-id` header to force `target ≠ source` in a small topology. |
+| Native plan emission by the Router (`remote_g2_plan.rs`) | ✅ **verified end-to-end** on the `x-worker-instance-id` co-located reproducer (§2.9). Phase 2's request reaches W2 with the Router-attached plan, W2 resolves it against W1's source registry, W1 pins all 19 blocks, the per-layer NIXL UCX READ moves the bytes, and W2 serves the prompt **without writing it to its own CPU pool** (`W2.descriptor_count = 0`). W1 `pin/unpin = 19/19` balanced, `pin_failures = 0`. Required five paired fixes across the two repos — see §2.7(a) for the patch list. |
 | Peer-endpoint discovery (target → source RPC) | ⚠️ POC uses static `peer_endpoints` config / `KVP2P_PEER_SOCKETS` env var. `RemoteG2OffloadingSpec.set_peer_endpoint()` is wired for dynamic injection but no discovery layer calls it on this branch. Planned follow-up: a Dynamo-etcd-backed registry that is symmetric across shim and native plan sources. |
 | Mixed local + remote within one load batch | ⚠️ all-or-nothing per batch. `lookup()` composes correctly per-key (local hit precedes plan path), but `prepare_load()` falls back wholesale to the local path if any key in the batch is uncovered by the plan. Loses an opportunity (not correctness); tracked as a follow-up to split into separate `LoadStoreSpec`s. |
 | Tensor parallelism | Single-TP only. `set_pool_layout` is called with `rank=0, num_workers=1`; registry, source RPC server, and NIXL agent are one-instance-per-process. Multi-TP wire shape (per-rank endpoints vs. one fan-out endpoint; per-rank pinned-memory layout) is open design work. |
