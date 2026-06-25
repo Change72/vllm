@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""OffloadingHandler that pulls KV from a remote source's host pool.
+"""Remote-read helper that pulls KV from a remote source's host pool.
 
-Registered on the worker side for the ``(RemoteG2LoadSpec,
-GPULoadStoreSpec)`` direction. Decodes the spec, ensures the source
-peer is known to the local NIXL adapter, then issues one READ per
-block from the source's pool offset into the target's GPU pool offset.
+Driven by ``RemoteG2OffloadingWorker.submit_load`` for the
+``RemoteG2LoadSpec -> GPULoadStoreSpec`` direction. Decodes the spec,
+ensures the source peer is known to the local NIXL adapter, then issues
+one READ per block from the source's pool offset into the target's GPU
+pool offset.
 
 For the same-host POC where NIXL is unavailable, the underlying
 ``RawNixlRemoteG2Adapter`` falls back to a plain memcpy. The handler
@@ -20,14 +21,14 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import GPULoadStoreSpec
+from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
+    LoadStoreSpec,
+    TransferResult,
+)
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.remote_g2.load_spec import RemoteG2LoadSpec
 from vllm.v1.kv_offload.remote_g2.nixl_adapter import RawNixlRemoteG2Adapter
-from vllm.v1.kv_offload.worker.worker import (
-    OffloadingHandler,
-    TransferResult,
-    TransferSpec,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -35,14 +36,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class RemoteG2TransferHandler(OffloadingHandler):
+class RemoteG2TransferHandler:
     """READ blocks from a remote host pool into local GPU blocks.
+
+    This is a plain helper composed by ``RemoteG2OffloadingWorker``: the
+    worker routes ``submit_load`` calls whose source is a
+    ``RemoteG2LoadSpec`` here, and merges this handler's completions into
+    its own ``get_finished``.
 
     The handler maintains a small registry of NIXL peers; the first
     transfer for an unseen ``peer_name`` triggers a ``get_metadata``
     handshake via the supplied ``ensure_peer`` callback.
 
-    The transfer is performed synchronously inside ``transfer_async``
+    The transfer is performed synchronously inside ``submit_load``
     (POC simplification): blocks are READ in submission order, success
     or failure is queued for ``get_finished``. M4 can switch to a real
     async pump using NIXL's ``post()`` + completion polling.
@@ -53,8 +59,8 @@ class RemoteG2TransferHandler(OffloadingHandler):
         *,
         adapter: RawNixlRemoteG2Adapter,
         gpu_page_size_bytes: int,
-        ensure_peer: "Callable[[str], bool]",
-        on_load_done: "Callable[[str], None] | None" = None,
+        ensure_peer: Callable[[str], bool],
+        on_load_done: Callable[[str], None] | None = None,
     ) -> None:
         self._adapter = adapter
         self._gpu_page_size = int(gpu_page_size_bytes)
@@ -63,10 +69,9 @@ class RemoteG2TransferHandler(OffloadingHandler):
         self._lock = threading.Lock()
         self._finished: deque[TransferResult] = deque()
 
-    def transfer_async(
-        self, job_id: int, transfer_spec: TransferSpec
+    def submit_load(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
     ) -> bool:
-        src_spec, dst_spec = transfer_spec
         if not isinstance(src_spec, RemoteG2LoadSpec):
             logger.error(
                 "RemoteG2TransferHandler: bad src spec type %r", type(src_spec)
@@ -174,6 +179,51 @@ class RemoteG2TransferHandler(OffloadingHandler):
                     success=success,
                     transfer_size=num_bytes,
                     transfer_time=elapsed,
-                    transfer_type=("REMOTE_G2", "GPU"),
                 )
             )
+
+
+class RemoteG2OffloadingWorker(CPUOffloadingWorker):
+    """CPUOffloadingWorker + a remote (KV-P2P) load path.
+
+    Stores and CPU-backed loads use the inherited GPU<->CPU handlers
+    unchanged. Loads whose source is a ``RemoteG2LoadSpec`` are routed to
+    an attached ``RemoteG2TransferHandler`` (a NIXL READ from a peer's
+    host pool). The remote handler is wired up by
+    ``RemoteG2OffloadingSpec.get_worker`` once the CPU pool tensors have
+    been materialised, via :attr:`remote_handler`.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.remote_handler: RemoteG2TransferHandler | None = None
+
+    def submit_load(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+    ) -> bool:
+        if isinstance(src_spec, RemoteG2LoadSpec):
+            if self.remote_handler is None:
+                logger.error(
+                    "RemoteG2OffloadingWorker: remote load requested before "
+                    "the NIXL handler was attached (job_id=%d)",
+                    job_id,
+                )
+                return False
+            return self.remote_handler.submit_load(job_id, src_spec, dst_spec)
+        return super().submit_load(job_id, src_spec, dst_spec)
+
+    def get_finished(self) -> list[TransferResult]:
+        finished = super().get_finished()
+        if self.remote_handler is not None:
+            finished = finished + self.remote_handler.get_finished()
+        return finished
+
+    def wait(self, job_ids: set[int]) -> None:
+        super().wait(job_ids)
+        if self.remote_handler is not None:
+            self.remote_handler.wait(job_ids)
+
+    def shutdown(self) -> None:
+        super().shutdown()
+        if self.remote_handler is not None:
+            self.remote_handler.shutdown()

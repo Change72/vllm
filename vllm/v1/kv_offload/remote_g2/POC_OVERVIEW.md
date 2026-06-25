@@ -94,7 +94,7 @@ LRU policy) to suppress eviction during the in-flight transfer.
 | `source_rpc.py` | `SourceG2RpcServer`. ZMQ REP loop with four methods: `resolve_and_lease`, `release_lease`, `get_metadata`, `stats`. Pickle wire format, byte-compatible with TRT-LLM. |
 | `target_client.py` | `TargetG2RpcClient`. Thread-safe ZMQ REQ wrapper used by the target manager to talk to a source's REP. |
 | `load_spec.py` | `RemoteG2LoadSpec`, `_RemoteBlockHandle`. The `LoadStoreSpec` subclass the vLLM scheduler dispatches on. |
-| `transfer_handler.py` | `RemoteG2TransferHandler`. `OffloadingHandler` for `(RemoteG2LoadSpec → GPULoadStoreSpec)`. Issues batched NIXL READs per layer, synchronizes CUDA, reports `TransferResult`. |
+| `transfer_handler.py` | `RemoteG2TransferHandler`: remote-read helper that `RemoteG2OffloadingWorker.submit_load` routes `RemoteG2LoadSpec → GPULoadStoreSpec` loads to. Issues batched NIXL READs per layer, synchronizes CUDA, reports `TransferResult`. |
 | `nixl_adapter.py` | `RawNixlRemoteG2Adapter` + `build_source_agent`. Thin wrapper over the NIXL UCX backend with a `fault_inject_every` knob for tests and a mock-memcpy fallback. |
 
 The Dynamo side adds three small files in

@@ -4,12 +4,12 @@
 
 Subclass of ``CPUOffloadingSpec`` that:
 
-* Reuses the inherited host pool (pinned CPU tensors) + GPU<->CPU
-  handlers.
+* Reuses the inherited host pool (pinned CPU tensors) via a
+  ``RemoteG2OffloadingWorker`` (a ``CPUOffloadingWorker`` subclass).
 * Swaps the manager for ``RemoteG2OffloadingManager``.
-* Brings up the source-side bits at first ``get_handlers`` call:
-  - Extracts the host pool base pointer from the inherited handlers
-    and sets the pool layout on the manager.
+* Brings up the source-side bits at first ``get_worker`` call:
+  - Reads the host pool base pointers from the inherited worker's
+    ``cpu_tensors`` and sets the pool layout on the manager.
   - Builds a NIXL source agent over the pool (or a mock when NIXL is
     unavailable) and registers a bundle provider so peers can fetch
     metadata via ``SourceG2RpcServer.get_metadata``.
@@ -17,8 +17,8 @@ Subclass of ``CPUOffloadingSpec`` that:
     path so the dynamo source bridge can forward to us unchanged.
 * Brings up the target-side bits in parallel:
   - Builds a NIXL target adapter over the local GPU pool.
-  - Registers a ``RemoteG2TransferHandler`` for the
-    ``(RemoteG2LoadSpec, GPULoadStoreSpec)`` direction.
+  - Attaches a ``RemoteG2TransferHandler`` to the worker so that
+    ``submit_load`` routes ``RemoteG2LoadSpec`` loads to it (NIXL READ).
   - Installs a ``TargetClientFactory`` on the manager that, given a
     plan, returns a ``TargetG2RpcClient`` pointed at the source.
 """
@@ -27,21 +27,17 @@ from __future__ import annotations
 
 import os
 import threading
-from collections.abc import Iterator
-from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
-    GPULoadStoreSpec,
-    LoadStoreSpec,
     OffloadingManager,
+    OffloadingWorker,
 )
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.remote_g2.data_model import RemoteKvReusePlan
-from vllm.v1.kv_offload.remote_g2.load_spec import RemoteG2LoadSpec
 from vllm.v1.kv_offload.remote_g2.manager import RemoteG2OffloadingManager
 from vllm.v1.kv_offload.remote_g2.nixl_adapter import (
     NixlSourceBundle,
@@ -54,9 +50,9 @@ from vllm.v1.kv_offload.remote_g2.source_rpc import (
 )
 from vllm.v1.kv_offload.remote_g2.target_client import TargetG2RpcClient
 from vllm.v1.kv_offload.remote_g2.transfer_handler import (
+    RemoteG2OffloadingWorker,
     RemoteG2TransferHandler,
 )
-from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 logger = init_logger(__name__)
 
@@ -153,6 +149,9 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         self._transfer_handler: RemoteG2TransferHandler | None = None
         self._target_clients: dict[int, TargetG2RpcClient] = {}
         self._clients_lock = threading.Lock()
+        # The remote (NIXL) source/target wiring is brought up lazily on the
+        # first get_worker() call, once the CPU pool tensors exist.
+        self._remote_initialized = False
 
     # --- public helpers ---
 
@@ -184,25 +183,36 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             self._manager = mgr
         return self._manager
 
-    def get_handlers(
+    def create_worker(
         self, kv_caches: CanonicalKVCaches
-    ) -> Iterator[
-        tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]
-    ]:
+    ) -> RemoteG2OffloadingWorker:
+        return RemoteG2OffloadingWorker(
+            kv_caches=kv_caches,
+            block_size_factor=self.block_size_factor,
+            num_cpu_blocks=self.num_blocks,
+        )
+
+    def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        worker = super().get_worker(kv_caches)
+        assert isinstance(worker, RemoteG2OffloadingWorker)
+        if not self._remote_initialized:
+            self._setup_remote(worker, kv_caches)
+            self._remote_initialized = True
+        return worker
+
+    def _setup_remote(
+        self, worker: RemoteG2OffloadingWorker, kv_caches: CanonicalKVCaches
+    ) -> None:
+        """Bring up the source + target NIXL wiring and attach the remote
+        load handler to ``worker``.
+
+        Runs once, after ``CPUOffloadingWorker.__init__`` has materialised
+        the inherited pinned-CPU pool tensors (``worker.cpu_tensors``).
+        """
         manager = self.get_manager()
         assert isinstance(manager, RemoteG2OffloadingManager)
 
-        # Materialise the inherited handlers so cpu_tensors gets built.
-        yielded_cpu_gpu = False
-        for entry in super().get_handlers(kv_caches):
-            yield entry
-            yielded_cpu_gpu = True
-
-        if not yielded_cpu_gpu:
-            return
-
-        assert self._handlers is not None
-        cpu_tensors = self._handlers.gpu_to_cpu_handler.dst_tensors
+        cpu_tensors = worker.cpu_tensors
         if not cpu_tensors:
             logger.warning(
                 "RemoteG2OffloadingSpec: no CPU tensors materialised; "
@@ -322,7 +332,9 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 ensure_peer=self._ensure_peer,
                 on_load_done=self._on_load_done,
             )
-            yield (RemoteG2LoadSpec, GPULoadStoreSpec, self._transfer_handler)
+            # The connector drives a single worker per spec; route
+            # RemoteG2LoadSpec loads to this handler from submit_load.
+            worker.remote_handler = self._transfer_handler
 
     def shutdown(self) -> None:
         if self._rpc_server is not None:

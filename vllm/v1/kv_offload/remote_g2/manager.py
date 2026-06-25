@@ -25,7 +25,6 @@ mirrors the same pattern with a per-tensor descriptor; deferred to M4.
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -33,6 +32,7 @@ from typing import Literal, Protocol
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
+    LookupResult,
     OffloadingEvent,
     OffloadKey,
     PrepareStoreOutput,
@@ -45,7 +45,6 @@ from vllm.v1.kv_offload.remote_g2.data_model import (
     RemoteG2Descriptor,
     RemoteG2ResolveResult,
     RemoteKvReusePlan,
-    SourceG2DescriptorRecord,
     SourceG2DescriptorRegistry,
 )
 from vllm.v1.kv_offload.remote_g2.load_spec import (
@@ -153,7 +152,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         self._resolve_cache: dict[str, _ResolveCacheEntry] = {}
         # Target-side RPC client for plan resolves; populated by the
         # spec once a plan is observed.
-        self._target_client_factory: "TargetClientFactory | None" = None
+        self._target_client_factory: TargetClientFactory | None = None
         # Counters live on the shared registry so the worker-side RPC
         # server (different Spec instance, same registry singleton) can
         # report them.
@@ -190,7 +189,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         )
 
     def set_target_client_factory(
-        self, factory: "TargetClientFactory"
+        self, factory: TargetClientFactory
     ) -> None:
         self._target_client_factory = factory
 
@@ -227,7 +226,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
 
     def _ensure_resolve(
         self, req_context: ReqContext, plan: RemoteKvReusePlan
-    ) -> "_ResolveCacheEntry | None":
+    ) -> _ResolveCacheEntry | None:
         cache = self._resolve_cache.get(req_context.req_id)
         if cache is not None:
             return cache
@@ -280,20 +279,24 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             )
         return entry
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         with self._rlock:
-            base_hit = super().lookup(key, req_context)
-        if base_hit:
-            return base_hit
+            base = super().lookup(key, req_context)
+        # Any local result (HIT / HIT_PENDING / RETRY) wins over the remote
+        # plan; only fall back to the plan on a genuine local MISS.
+        if base != LookupResult.MISS:
+            return base
 
         plan = self._peek_plan(req_context)
         if plan is None:
-            return base_hit
+            return base
         entry = self._ensure_resolve(req_context, plan)
         if entry is None or entry.result.lease_id is None:
-            return base_hit
+            return base
         block_hash_int = block_hash_to_router_int(get_offload_block_hash(key))
-        return block_hash_int in entry.descriptor_by_hash
+        if block_hash_int in entry.descriptor_by_hash:
+            return LookupResult.HIT
+        return LookupResult.MISS
 
     def prepare_load(
         self,
