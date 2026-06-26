@@ -124,6 +124,28 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_worker.build_connector_worker_meta()
         return None
 
+    # ------------------------------------------------------------------
+    # Handshake metadata pass-through for OffloadingSpec subclasses that
+    # implement scheduler<->worker NIXL agent exchange (e.g. Remote-G2
+    # KV-P2P). The default OffloadingSpec subclasses (CPUOffloadingSpec)
+    # return None / no-op, preserving existing behaviour.
+    # ------------------------------------------------------------------
+
+    def get_handshake_metadata(self):  # type: ignore[override]
+        if self.connector_worker is not None:
+            spec = getattr(self.connector_worker, "spec", None)
+            fn = getattr(spec, "get_handshake_metadata", None)
+            if fn is not None:
+                return fn()
+        return None
+
+    def set_xfer_handshake_metadata(self, metadata) -> None:  # type: ignore[override]
+        if self.connector_scheduler is not None:
+            spec = getattr(self.connector_scheduler, "spec", None)
+            fn = getattr(spec, "set_xfer_handshake_metadata", None)
+            if fn is not None:
+                fn(metadata)
+
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)

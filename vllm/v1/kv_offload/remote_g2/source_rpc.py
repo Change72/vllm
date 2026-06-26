@@ -139,6 +139,11 @@ class SourceG2RpcServer:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._bundle_provider: Any = None
+        # Per-rank provider used by the TP>1 scheduler-coordinator path.
+        # ``get_metadata(tp_rank=N)`` consults this first; if it returns
+        # a bundle, use it. Otherwise fall back to ``_bundle_provider``
+        # (TP=1 path).
+        self._per_rank_bundle_provider: Any = None
 
     @property
     def socket_path(self) -> str:
@@ -153,6 +158,18 @@ class SourceG2RpcServer:
         The provider may return ``None`` if the bundle is still pending.
         """
         self._bundle_provider = provider
+
+    def set_per_rank_bundle_provider(self, provider: Any) -> None:
+        """Register a callable ``provider(tp_rank: int) -> bundle | None``.
+
+        Used by the TP>1 scheduler-coordinator path: the scheduler
+        caches per-rank NIXL agent payloads via the handshake mechanism
+        and exposes them through this provider. ``get_metadata`` reads
+        the ``tp_rank`` field from the request payload and calls the
+        provider with it. Falls back to ``_bundle_provider`` when
+        ``tp_rank`` is missing or unknown.
+        """
+        self._per_rank_bundle_provider = provider
 
     def start(self) -> None:
         if self._thread is not None:
@@ -282,7 +299,23 @@ class SourceG2RpcServer:
         return {"ok": True, "result": released}
 
     def _handle_metadata(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        bundle = self._bundle_provider() if self._bundle_provider else None
+        # TP>1 scheduler-coordinator path: caller passes ``tp_rank`` and
+        # we return that rank's cached NIXL agent payload. TP=1 path:
+        # ``tp_rank`` is absent and we fall back to the legacy single
+        # bundle provider.
+        tp_rank = payload.get("tp_rank")
+        bundle = None
+        if tp_rank is not None and self._per_rank_bundle_provider is not None:
+            try:
+                bundle = self._per_rank_bundle_provider(int(tp_rank))
+            except Exception:
+                logger.exception(
+                    "RemoteG2 per-rank bundle provider raised "
+                    "(tp_rank=%s)", tp_rank,
+                )
+                bundle = None
+        if bundle is None and self._bundle_provider is not None:
+            bundle = self._bundle_provider()
         if bundle is None:
             return {"ok": False, "error": "nixl_source_bundle_not_ready"}
 
@@ -290,13 +323,16 @@ class SourceG2RpcServer:
         if peer_metadata_b64:
             try:
                 peer_bytes = base64.b64decode(peer_metadata_b64)
-                loaded_name = bundle.agent.add_remote_agent(peer_bytes)
-                logger.info(
-                    "RemoteG2 source add_remote_agent loaded peer name=%s "
-                    "(bytes=%d)",
-                    loaded_name,
-                    len(peer_bytes),
-                )
+                # The TP>1 wrapped bundle has no live ``agent`` (the
+                # agent lives in the worker process); skip the
+                # add_remote_agent step for that case.
+                agent = getattr(bundle, "agent", None)
+                if agent is not None:
+                    loaded_name = agent.add_remote_agent(peer_bytes)
+                    logger.info(
+                        "RemoteG2 source add_remote_agent loaded peer "
+                        "name=%s (bytes=%d)", loaded_name, len(peer_bytes),
+                    )
             except Exception:
                 logger.exception("RemoteG2 source add_remote_agent failed")
 

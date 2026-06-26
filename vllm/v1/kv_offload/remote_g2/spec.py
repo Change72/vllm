@@ -80,6 +80,34 @@ def _resolve_bool(extra: dict, key: str, env: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+class _BundleFromPayload:
+    """NixlSourceBundle-shaped wrapper around a RemoteG2HandshakePayload.
+
+    The source RPC server's ``get_metadata`` returns a dict serialised
+    from a NixlSourceBundle. For the scheduler-side TP>1 path the
+    bundle isn't local — we receive each rank's metadata via the
+    handshake mechanism and need to expose it through the same
+    interface. This tiny adapter wraps the payload so the RPC handler
+    code doesn't need to special-case the source.
+    """
+
+    def __init__(self, payload):
+        self.agent_desc = payload.agent_metadata
+        self.layer_pool_base_ptrs = list(payload.layer_pool_base_ptrs)
+        self.layer_pool_size_bytes = list(payload.layer_pool_size_bytes)
+        self.page_size_bytes = int(payload.page_size_bytes)
+        self.source_generation = int(payload.source_generation)
+        self.remote_name = payload.agent_name
+        self.pool_base_ptr = (
+            int(payload.layer_pool_base_ptrs[0])
+            if payload.layer_pool_base_ptrs else 0
+        )
+        self.pool_size_bytes = (
+            int(payload.layer_pool_size_bytes[0])
+            if payload.layer_pool_size_bytes else 0
+        )
+
+
 class RemoteG2OffloadingSpec(CPUOffloadingSpec):
     """CPUOffloadingSpec + Remote G2 (KV-P2P) capabilities.
 
@@ -132,6 +160,14 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 self.kv_events_config.enable_kv_cache_events,
                 self.kv_events_config.self_describing_kv_events,
             )
+        # TP topology. world_size is known at construction (it's a config
+        # value); the actual rank is read lazily from get_tp_group() at
+        # get_handlers() time because torch.distributed may not be fully
+        # initialised here. ``cpu_page_size_per_worker`` is already
+        # computed by CPUOffloadingSpec.__init__ above (= the per-rank
+        # byte size of one offloaded block, totalled across all layers).
+        self.tp_size: int = vllm_config.parallel_config.tensor_parallel_size
+        self.tp_rank: int = -1  # resolved in get_handlers()
 
         extra = self.extra_config
         self.source_worker_id = _resolve_int(
@@ -176,11 +212,28 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         self._source_bundle: NixlSourceBundle | None = None
         self._target_adapter: RawNixlRemoteG2Adapter | None = None
         self._transfer_handler: RemoteG2TransferHandler | None = None
+        # Legacy single-rank client cache (TP=1 path); kept for the
+        # existing _ensure_peer code that still keys by worker_id only.
         self._target_clients: dict[int, TargetG2RpcClient] = {}
+        # TP-aware client cache keyed by (source_worker_id, my_tp_rank).
+        self._target_clients_by_rank: dict[
+            tuple[int, int], TargetG2RpcClient
+        ] = {}
         self._clients_lock = threading.Lock()
         # The remote (NIXL) source/target wiring is brought up lazily on the
         # first get_worker() call, once the CPU pool tensors exist.
         self._remote_initialized = False
+        # Handshake-metadata state for TP>1 scheduler-coordinator path.
+        # Worker fills _handshake_payload during get_handlers and exposes
+        # it via get_handshake_metadata. Scheduler caches the merged
+        # per-rank dict in _per_rank_handshake when EngineCore calls
+        # set_xfer_handshake_metadata, then starts/updates the source
+        # RPC server so its get_metadata can answer per-rank queries.
+        from vllm.v1.kv_offload.remote_g2.data_model import (
+            RemoteG2HandshakePayload as _Payload,
+        )
+        self._handshake_payload: _Payload | None = None
+        self._per_rank_handshake: dict[int, _Payload] = {}
 
     # --- public helpers ---
 
@@ -206,6 +259,50 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 lease_ttl_ms=self.lease_ttl_ms,
             )
             mgr.set_target_client_factory(self._build_target_client)
+
+            # In TP=1 the scheduler and worker are the same process, so
+            # the worker's set_pool_layout call (in get_handlers) is
+            # observable from the scheduler manager's index too. In
+            # TP>1 they are *separate processes* — the worker call only
+            # populates that worker's local registry singleton, and the
+            # scheduler's singleton stays with pool_layout_ready=False,
+            # which causes _upsert_descriptors_locked to skip every
+            # block: descriptors are never published, and resolve calls
+            # return "missing".
+            #
+            # Set a placeholder pool layout here using the values the
+            # scheduler already knows (page_size_per_worker, num_blocks).
+            # Pointers are placeholders because they are only used in
+            # the descriptor's debug nixl_memory_desc.ptr field; the
+            # real READ on the target side uses the source NIXL agent's
+            # registered memory (carried in the per-rank NixlSourceBundle).
+            # The worker-side get_handlers call later overwrites with
+            # real pointers within the worker process.
+            if self.cpu_page_size_per_worker > 0:
+                try:
+                    num_layers = sum(
+                        len(g.layer_names)
+                        for g in self.kv_cache_config.kv_cache_groups
+                    )
+                except Exception:
+                    num_layers = 1
+                num_layers = max(num_layers, 1)
+                per_layer_page_size = (
+                    self.cpu_page_size_per_worker // num_layers
+                )
+                per_layer_pool_size = (
+                    self.num_blocks * per_layer_page_size
+                )
+                if not mgr.registry.pool_layout_ready():
+                    mgr.set_pool_layout(
+                        layer_pool_base_ptrs=[1] * num_layers,
+                        layer_pool_size_bytes=[per_layer_pool_size]
+                            * num_layers,
+                        page_size_bytes=per_layer_page_size,
+                        rank=0,
+                        num_workers=1,
+                    )
+
             self._manager = mgr
         return self._manager
 
@@ -236,6 +333,22 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         manager = self.get_manager()
         assert isinstance(manager, RemoteG2OffloadingManager)
 
+        # Resolve our TP rank now that get_tp_group() is reliably
+        # initialised (this hook runs after model load + KV cache alloc,
+        # well after torch.distributed setup).
+        if self.tp_size > 1:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            self.tp_rank = int(get_tensor_model_parallel_rank())
+            tp_world = int(get_tensor_model_parallel_world_size())
+            assert tp_world == self.tp_size, (
+                f"tp_size mismatch: config={self.tp_size} group={tp_world}"
+            )
+        else:
+            self.tp_rank = 0
+
         cpu_tensors = worker.cpu_tensors
         if not cpu_tensors:
             logger.warning(
@@ -262,7 +375,17 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         cpu_layer_sizes = [page_size_bytes * int(t.shape[0]) for t in cpu_tensors]
 
         # Push pool layout to the shared registry; descriptor publish
-        # path runs against the per-layer ptrs from now on.
+        # path runs against the per-layer ptrs from now on. For TP>1
+        # each worker process has its own independent per-rank CPU
+        # pool — the local tensor is already this worker's slice with
+        # ``page_size_bytes`` = the per-rank page size and the byte
+        # offset within the local pool is just ``block_id *
+        # page_size_bytes``. So we pass rank=0 num_workers=1: the
+        # registry's formula then evaluates to that.
+        # (The shared-mmap interleaved-row formula in set_pool_layout's
+        # default — block_id * page_size * num_workers + rank *
+        # page_size — only applies if the workers share one pool, which
+        # is not the default vLLM allocation path.)
         manager.set_pool_layout(
             layer_pool_base_ptrs=cpu_layer_base_ptrs,
             layer_pool_size_bytes=cpu_layer_sizes,
@@ -271,16 +394,23 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             num_workers=1,
         )
         logger.info(
-            "RemoteG2OffloadingSpec: registered %d CPU layer pools "
-            "(num_blocks=%d, page_size=%d bytes/block, total=%.2f GiB)",
+            "RemoteG2OffloadingSpec[tp=%d/%d]: registered %d CPU layer "
+            "pools (num_blocks=%d, page_size=%d bytes/block, "
+            "total=%.2f GiB)",
+            self.tp_rank,
+            self.tp_size,
             len(cpu_tensors),
             num_cpu_blocks,
             page_size_bytes,
             sum(cpu_layer_sizes) / (1 << 30),
         )
 
-        # Source NIXL agent (or mock).
-        agent_name = f"remote-g2-src-{self.source_worker_id}"
+        # Source NIXL agent (or mock). TP-aware naming so multiple
+        # worker processes (one per TP rank) in the same instance do
+        # not collide in the NIXL agent namespace.
+        agent_name = (
+            f"remote-g2-src-{self.source_worker_id}-tp{self.tp_rank}"
+        )
         bundle = build_source_agent(
             agent_name,
             cpu_layer_base_ptrs,
@@ -296,19 +426,48 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 "peers cannot fetch metadata via get_metadata."
             )
 
-        # ZMQ REP server (binds the engine-side socket).
-        if self.enable_source_rpc and self._rpc_server is None:
+        # Stash this rank's NIXL bundle as the handshake payload that
+        # ``get_handshake_metadata`` will return up the collective_rpc
+        # chain to the scheduler.
+        if bundle is not None:
+            from vllm.v1.kv_offload.remote_g2.data_model import (
+                RemoteG2HandshakePayload,
+            )
+            self._handshake_payload = RemoteG2HandshakePayload(
+                tp_rank=self.tp_rank,
+                agent_name=agent_name,
+                agent_metadata=bundle.agent_desc,
+                layer_pool_base_ptrs=list(bundle.layer_pool_base_ptrs),
+                layer_pool_size_bytes=list(bundle.layer_pool_size_bytes),
+                page_size_bytes=int(bundle.page_size_bytes),
+                source_generation=int(bundle.source_generation),
+            )
+
+        # ZMQ REP server location depends on TP topology:
+        # - TP == 1: worker == scheduler (same Python process), so we
+        #   start the RPC server here in the worker path. Legacy code.
+        # - TP > 1: worker and scheduler are separate processes. The
+        #   scheduler-side spec must own the source RPC server because
+        #   the descriptor index lives in the scheduler's registry.
+        #   The worker only publishes its NIXL agent via the handshake
+        #   payload above; the scheduler-side ``set_xfer_handshake_metadata``
+        #   starts the RPC server bound to the canonical (non-rank-scoped)
+        #   path and answers ``get_metadata`` per tp_rank from the
+        #   cached payloads.
+        if self.tp_size == 1 and self.enable_source_rpc and self._rpc_server is None:
+            rpc_path = self.source_rpc_socket_path
             self._rpc_server = SourceG2RpcServer(
                 manager.registry,
-                socket_path=self.source_rpc_socket_path,
+                socket_path=rpc_path,
                 manager=manager,
             )
             if bundle is not None:
                 self._rpc_server.set_nixl_bundle_provider(lambda b=bundle: b)
             self._rpc_server.start()
             logger.info(
-                "RemoteG2OffloadingSpec source RPC at ipc://%s (source_worker_id=%d)",
-                self.source_rpc_socket_path,
+                "RemoteG2OffloadingSpec source RPC at ipc://%s "
+                "(source_worker_id=%d, tp=1)",
+                rpc_path,
                 self.source_worker_id,
             )
 
@@ -326,7 +485,9 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 len(gpu_layer_bases),
                 len(cpu_layer_base_ptrs),
             )
-        target_agent_name = f"remote-g2-tgt-{self.source_worker_id}"
+        target_agent_name = (
+            f"remote-g2-tgt-{self.source_worker_id}-tp{self.tp_rank}"
+        )
         try:
             self._target_adapter = RawNixlRemoteG2Adapter(
                 target_agent_name,
@@ -362,7 +523,111 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             for client in self._target_clients.values():
                 with contextlib.suppress(Exception):
                     client.close()
+            for client in self._target_clients_by_rank.values():
+                with contextlib.suppress(Exception):
+                    client.close()
             self._target_clients.clear()
+            self._target_clients_by_rank.clear()
+
+    # ----------------------------------------------------------------
+    # Handshake metadata hooks called by OffloadingConnector. The base
+    # OffloadingSpec does not declare these; OffloadingConnector calls
+    # them via getattr so a spec without them simply opts out.
+    # ----------------------------------------------------------------
+
+    def get_handshake_metadata(self) -> Any:
+        """Worker side: return this rank's NIXL agent + pool layout.
+
+        Called via collective_rpc("get_kv_connector_handshake_metadata")
+        from EngineCore after KV cache registration. The wrapping vLLM
+        machinery automatically tags the return value with this
+        worker's tp_rank.
+        """
+        return self._handshake_payload
+
+    def set_xfer_handshake_metadata(
+        self, metadata: dict[int, Any]
+    ) -> None:
+        """Scheduler side: cache the per-rank payloads and start the
+        source RPC server bound to the canonical socket path.
+
+        ``metadata`` is keyed by tp_rank with values of type
+        ``RemoteG2HandshakePayload`` (or whatever each worker's
+        ``get_handshake_metadata`` returned). We re-validate and ignore
+        any None or mistyped entries gracefully.
+        """
+        from vllm.v1.kv_offload.remote_g2.data_model import (
+            RemoteG2HandshakePayload,
+        )
+        per_rank: dict[int, RemoteG2HandshakePayload] = {}
+        for tp_rank, payload in metadata.items():
+            if not isinstance(payload, RemoteG2HandshakePayload):
+                continue
+            per_rank[int(tp_rank)] = payload
+        if not per_rank:
+            logger.warning(
+                "RemoteG2: set_xfer_handshake_metadata received no "
+                "valid RemoteG2HandshakePayload entries (got %d items)",
+                len(metadata),
+            )
+            return
+        self._per_rank_handshake.update(per_rank)
+        logger.info(
+            "RemoteG2: cached handshake payloads for tp_ranks=%s "
+            "(source_worker_id=%d)",
+            sorted(per_rank.keys()),
+            self.source_worker_id,
+        )
+
+        # Start the scheduler-side source RPC server. The registry
+        # already has descriptors via the placeholder set_pool_layout
+        # call in get_manager(); resolve_and_lease therefore works.
+        # get_metadata uses the per-rank cache populated above.
+        if self.enable_source_rpc and self._rpc_server is None:
+            manager = self.get_manager()
+            self._rpc_server = SourceG2RpcServer(
+                manager.registry,
+                socket_path=self.source_rpc_socket_path,
+                manager=manager,
+            )
+            # Wire a per-rank bundle provider: get_metadata(tp_rank=N)
+            # returns rank N's NIXL agent metadata + pool layout.
+            self._rpc_server.set_per_rank_bundle_provider(
+                self._per_rank_bundle_provider
+            )
+            self._rpc_server.start()
+            logger.info(
+                "RemoteG2OffloadingSpec source RPC at ipc://%s "
+                "(source_worker_id=%d, tp_size=%d) [scheduler]",
+                self.source_rpc_socket_path,
+                self.source_worker_id,
+                self.tp_size,
+            )
+
+    def _per_rank_bundle_provider(self, tp_rank: int):
+        """Return a NixlSourceBundle-like dict for the requested rank."""
+        payload = self._per_rank_handshake.get(int(tp_rank))
+        if payload is None:
+            return None
+        return _BundleFromPayload(payload)
+
+    # --- TP-aware socket-path helpers ---
+
+    @staticmethod
+    def _rank_scoped_socket_path(base_path: str, tp_rank: int) -> str:
+        """Compute the per-rank socket path from a base path.
+
+        Convention: append ``_tp{rank}`` before the file extension (if
+        any) so that ``/tmp/dynamo_remote_g2_w1.sock`` becomes
+        ``/tmp/dynamo_remote_g2_w1_tp0.sock`` for rank 0. This is
+        deterministic on both source and target, so the target can
+        compute the source's RPC socket path without an extra config
+        knob.
+        """
+        if "." in base_path.rsplit("/", 1)[-1]:
+            head, _, tail = base_path.rpartition(".")
+            return f"{head}_tp{tp_rank}.{tail}"
+        return f"{base_path}_tp{tp_rank}"
 
     # --- target side wiring ---
 
@@ -376,11 +641,16 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 plan.source_worker_id,
             )
             return None
+        # Cache keyed by (source_worker_id, my_tp_rank). For TP>1 the
+        # source-side RPC is in scheduler so all our target ranks talk
+        # to the same socket, but each rank uses its own client so
+        # subsequent get_metadata calls carry the right tp_rank.
+        cache_key = (int(plan.source_worker_id), int(self.tp_rank))
         with self._clients_lock:
-            client = self._target_clients.get(plan.source_worker_id)
+            client = self._target_clients_by_rank.get(cache_key)
             if client is None:
                 client = TargetG2RpcClient(sock)
-                self._target_clients[plan.source_worker_id] = client
+                self._target_clients_by_rank[cache_key] = client
         return client
 
     def _ensure_peer(self, peer_name: str) -> bool:
@@ -398,20 +668,25 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         except ValueError:
             logger.warning("RemoteG2: bad peer_name %r", peer_name)
             return False
-        client = None
+        # Reuse the per-rank client cache. For TP>1 the cache key keeps
+        # the connection scoped to this target rank so we can pass our
+        # tp_rank to get_metadata; the socket itself is the canonical
+        # (non-rank-scoped) source path.
+        cache_key = (worker_id, int(self.tp_rank))
         with self._clients_lock:
-            client = self._target_clients.get(worker_id)
+            client = self._target_clients_by_rank.get(cache_key)
         if client is None:
             sock = self._peer_endpoints.get(worker_id)
             if sock is None:
                 return False
             client = TargetG2RpcClient(sock)
             with self._clients_lock:
-                self._target_clients.setdefault(worker_id, client)
-                client = self._target_clients[worker_id]
+                self._target_clients_by_rank.setdefault(cache_key, client)
+                client = self._target_clients_by_rank[cache_key]
         try:
             bundle = client.get_metadata(
-                peer_agent_metadata=self._target_adapter.agent_metadata
+                peer_agent_metadata=self._target_adapter.agent_metadata,
+                tp_rank=self.tp_rank,
             )
         except Exception:
             logger.exception("RemoteG2: get_metadata RPC failed for %s", peer_name)
@@ -441,7 +716,11 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
     def _on_load_done(self, lease_id: str) -> None:
         # Best-effort release. The plan-driven lookup cache also calls
         # release on request finish; one of the two paths will land.
-        for client in list(self._target_clients.values()):
+        # Try per-rank clients first (TP>1 path), then legacy clients.
+        candidates = list(self._target_clients_by_rank.values()) + list(
+            self._target_clients.values()
+        )
+        for client in candidates:
             try:
                 if client.release_lease(lease_id, reason="load_done"):
                     return

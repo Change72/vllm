@@ -172,10 +172,17 @@ class TargetG2RpcClient:
         return dict(reply["result"])
 
     def get_metadata(
-        self, peer_agent_metadata: bytes | None = None
+        self,
+        peer_agent_metadata: bytes | None = None,
+        *,
+        tp_rank: int | None = None,
     ) -> dict[str, Any] | None:
         """Fetch the source's NIXL bundle and, optionally, hand it our
         local agent metadata so it can call ``add_remote_agent`` first.
+
+        For TP>1 callers, ``tp_rank`` selects which source-side rank's
+        NIXL agent metadata to fetch. TP=1 callers may omit it; the
+        server falls back to its single bundle.
 
         Returns ``None`` when the source isn't ready yet (the M2 stub
         reports ``nixl_source_bundle_not_ready`` until M3 plugs the
@@ -186,6 +193,8 @@ class TargetG2RpcClient:
             payload["peer_metadata_b64"] = base64.b64encode(
                 peer_agent_metadata
             ).decode("ascii")
+        if tp_rank is not None:
+            payload["tp_rank"] = int(tp_rank)
         reply = self._request("get_metadata", payload)
         if not reply.get("ok"):
             logger.debug(

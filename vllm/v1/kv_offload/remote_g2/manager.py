@@ -198,13 +198,6 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
     @staticmethod
     def _peek_plan(req_context: ReqContext) -> RemoteKvReusePlan | None:
         params = req_context.kv_transfer_params
-        import logging as _dbgl_pp
-        _dbgl_pp.getLogger(__name__).warning(
-            "DBG_PEEK_PLAN: req_id=%s params_type=%s keys=%s",
-            req_context.req_id,
-            type(params).__name__,
-            list(params.keys()) if isinstance(params, dict) else None,
-        )
         if not params:
             return None
         raw = params.get(REMOTE_G2_PLAN_KEY)

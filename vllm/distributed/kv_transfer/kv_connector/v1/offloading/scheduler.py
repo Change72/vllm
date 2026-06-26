@@ -322,6 +322,12 @@ class OffloadingConnectorScheduler:
         self,
         spec: OffloadingSpec,
     ):
+        # Stored so OffloadingConnector can route handshake-metadata
+        # calls (get_handshake_metadata / set_xfer_handshake_metadata)
+        # back to the spec without changing the OffloadingSpec base
+        # interface. Optional-by-design: specs that do not implement
+        # those hooks simply have OffloadingConnector return None.
+        self.spec = spec
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats: OffloadingConnectorStats | None = None

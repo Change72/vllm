@@ -30,6 +30,32 @@ REMOTE_KV_REUSE_PLAN_VERSION = 1
 REMOTE_G2_TIERS = frozenset({"host_pinned", "g2"})
 
 
+@dataclass
+class RemoteG2HandshakePayload:
+    """Per-rank NIXL agent + pool layout pushed up from worker to scheduler.
+
+    Each TP rank's worker process builds its own NIXL source agent over
+    its own CPU pinned pool. The scheduler-side source RPC server caches
+    one of these per ``tp_rank`` so it can answer ``get_metadata``
+    requests on behalf of the right rank.
+
+    Built in worker-side ``RemoteG2OffloadingSpec.get_handshake_metadata``
+    after KV cache registration. Wrapped in the connector's
+    ``KVConnectorHandshakeMetadata`` envelope and flown up via vLLM's
+    ``collective_rpc("get_kv_connector_handshake_metadata")`` ->
+    ``set_xfer_handshake_metadata({tp_rank: payload})`` mechanism (see
+    ``vllm/v1/engine/core.py:170``).
+    """
+
+    tp_rank: int
+    agent_name: str
+    agent_metadata: bytes
+    layer_pool_base_ptrs: list[int]
+    layer_pool_size_bytes: list[int]
+    page_size_bytes: int
+    source_generation: int = 1
+
+
 def _now_ms() -> int:
     # Wall-clock millis (not monotonic) so plan.expires_at_ms (from the
     # Router) and our lease TTLs share the same time base across processes.
