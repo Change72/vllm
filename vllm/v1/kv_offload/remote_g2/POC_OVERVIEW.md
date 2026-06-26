@@ -374,6 +374,7 @@ exec python3 -m dynamo.vllm \
     \"kv_role\":\"kv_both\",
     \"kv_connector_extra_config\":{
       \"spec_name\":\"RemoteG2OffloadingSpec\",
+      \"self_describing_kv_events\":true,
       \"cpu_bytes_to_use\":17179869184,
       \"source_worker_id\":${WID},
       \"source_dp_rank\":0,
@@ -691,7 +692,7 @@ exec python3 -m dynamo.vllm \
   --enable-prefix-caching \
   --max-num-seqs 4 \
   --kv-events-config "{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"${EVENT_ENDPOINT}\"}" \
-  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"RemoteG2OffloadingSpec\",\"cpu_bytes_to_use\":17179869184,\"source_worker_id\":${WORKER_ID},\"source_dp_rank\":0,\"source_rpc_socket_path\":\"${SOCKET}\",\"use_mock_nixl\":false,\"peer_endpoints\":\"${PEER_WID}=${PEER_SOCK}\"}}"
+  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"RemoteG2OffloadingSpec\",\"self_describing_kv_events\":true,\"cpu_bytes_to_use\":17179869184,\"source_worker_id\":${WORKER_ID},\"source_dp_rank\":0,\"source_rpc_socket_path\":\"${SOCKET}\",\"use_mock_nixl\":false,\"peer_endpoints\":\"${PEER_WID}=${PEER_SOCK}\"}}"
 ```
 
 **Step 2 — discover the Dynamo `worker_instance_id` for each

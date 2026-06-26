@@ -25,6 +25,7 @@ Subclass of ``CPUOffloadingSpec`` that:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 
@@ -102,6 +103,36 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
 
+        # Router-driven KV-P2P reuse depends on self-describing KV events.
+        # Since PR #43468 the offloading event stream only carries token_ids
+        # and parent_block_hash when BOTH kv_events_config.enable_kv_cache_events
+        # and kv_connector_extra_config["self_describing_kv_events"] are set;
+        # otherwise BlockStored events use the legacy placeholder payload
+        # (empty token_ids, no parent). The Dynamo router needs those fields to
+        # index host-pinned offloaded blocks, so without them the router never
+        # finds remote candidates and no reuse plan is produced. Warn loudly so
+        # this misconfiguration fails visibly instead of silently no-op'ing.
+        # NOTE: not fatal — the source-publishing / manually-injected-plan path
+        # (e.g. the two_engines eval) does not use the router and works without
+        # KV events, so a hard raise here would break that valid use.
+        if not (
+            self.kv_events_config.enable_kv_cache_events
+            and self.kv_events_config.self_describing_kv_events
+        ):
+            logger.warning(
+                "RemoteG2OffloadingSpec: router-driven KV-P2P reuse requires "
+                "self-describing KV events, but they are not enabled "
+                "(enable_kv_cache_events=%s, self_describing_kv_events=%s). "
+                "Offloaded BlockStored events will use the legacy placeholder "
+                "payload (no token_ids / parent_block_hash), so the Dynamo "
+                "router cannot index host-pinned blocks and no reuse plan will "
+                "be produced. Set kv_events_config.enable_kv_cache_events=true "
+                "and kv_connector_extra_config['self_describing_kv_events']=true "
+                "for the router-driven path.",
+                self.kv_events_config.enable_kv_cache_events,
+                self.kv_events_config.self_describing_kv_events,
+            )
+
         extra = self.extra_config
         self.source_worker_id = _resolve_int(
             extra, "source_worker_id", "REMOTE_G2_SOURCE_WORKER_ID", -1
@@ -126,9 +157,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         self.use_mock_nixl = _resolve_bool(
             extra, "use_mock_nixl", "REMOTE_G2_USE_MOCK_NIXL", False
         )
-        self.enable_source_rpc: bool = bool(
-            extra.get("enable_source_rpc", True)
-        )
+        self.enable_source_rpc: bool = bool(extra.get("enable_source_rpc", True))
 
         # peer_worker_id -> source rpc socket path. Populated either
         # from extra_config or via set_peer_endpoint() at runtime.
@@ -162,13 +191,10 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         if self._manager is None:
             kv_events_config = self.vllm_config.kv_events_config
             enable_events = (
-                kv_events_config is not None
-                and kv_events_config.enable_kv_cache_events
+                kv_events_config is not None and kv_events_config.enable_kv_cache_events
             )
             store_threshold = int(self.extra_config.get("store_threshold", 0))
-            max_tracker_size = int(
-                self.extra_config.get("max_tracker_size", 64_000)
-            )
+            max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
             mgr = RemoteG2OffloadingManager(
                 num_blocks=self.num_blocks,
                 source_worker_id=self.source_worker_id,
@@ -183,9 +209,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             self._manager = mgr
         return self._manager
 
-    def create_worker(
-        self, kv_caches: CanonicalKVCaches
-    ) -> RemoteG2OffloadingWorker:
+    def create_worker(self, kv_caches: CanonicalKVCaches) -> RemoteG2OffloadingWorker:
         return RemoteG2OffloadingWorker(
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
@@ -235,9 +259,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         page_size_bytes = layer_page_sizes[0]
         num_cpu_blocks = int(cpu_tensors[0].shape[0])
         cpu_layer_base_ptrs = [int(t.data_ptr()) for t in cpu_tensors]
-        cpu_layer_sizes = [
-            page_size_bytes * int(t.shape[0]) for t in cpu_tensors
-        ]
+        cpu_layer_sizes = [page_size_bytes * int(t.shape[0]) for t in cpu_tensors]
 
         # Push pool layout to the shared registry; descriptor publish
         # path runs against the per-layer ptrs from now on.
@@ -285,20 +307,16 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 self._rpc_server.set_nixl_bundle_provider(lambda b=bundle: b)
             self._rpc_server.start()
             logger.info(
-                "RemoteG2OffloadingSpec source RPC at ipc://%s "
-                "(source_worker_id=%d)",
+                "RemoteG2OffloadingSpec source RPC at ipc://%s (source_worker_id=%d)",
                 self.source_rpc_socket_path,
                 self.source_worker_id,
             )
 
         # Target-side adapter. Uses the local GPU pool tensors (one per
         # layer) as the transfer destination.
-        gpu_layer_bases = [
-            int(t.tensor.data_ptr()) for t in kv_caches.tensors
-        ]
+        gpu_layer_bases = [int(t.tensor.data_ptr()) for t in kv_caches.tensors]
         gpu_layer_sizes = [
-            int(t.tensor.numel() * t.tensor.element_size())
-            for t in kv_caches.tensors
+            int(t.tensor.numel() * t.tensor.element_size()) for t in kv_caches.tensors
         ]
         if len(gpu_layer_bases) != len(cpu_layer_base_ptrs):
             logger.warning(
@@ -342,17 +360,13 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             self._rpc_server = None
         with self._clients_lock:
             for client in self._target_clients.values():
-                try:
+                with contextlib.suppress(Exception):
                     client.close()
-                except Exception:
-                    pass
             self._target_clients.clear()
 
     # --- target side wiring ---
 
-    def _build_target_client(
-        self, plan: RemoteKvReusePlan
-    ) -> TargetG2RpcClient | None:
+    def _build_target_client(self, plan: RemoteKvReusePlan) -> TargetG2RpcClient | None:
         sock = self._peer_endpoints.get(int(plan.source_worker_id))
         if not sock:
             logger.warning(
