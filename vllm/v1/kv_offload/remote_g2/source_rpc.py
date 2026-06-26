@@ -99,6 +99,17 @@ def default_socket_path(dynamo_pid: int | None = None) -> str:
     return f"/tmp/dynamo_remote_g2_ipc_{pid}.sock"
 
 
+def zmq_endpoint(socket_path: str) -> str:
+    """Resolve a socket path to a ZMQ endpoint.
+
+    A bare path is a host-local Unix-domain (ipc) socket; a path that already
+    carries a scheme (e.g. ``tcp://0.0.0.0:5555``) is used verbatim. The latter
+    is what cross-node 2-pod runs need, where the target connects to the
+    source's TCP endpoint over the network.
+    """
+    return socket_path if "://" in socket_path else f"ipc://{socket_path}"
+
+
 class SourceG2RpcServer:
     """ZMQ REP server thread serving the TRT-LLM-compatible RPC protocol.
 
@@ -146,14 +157,15 @@ class SourceG2RpcServer:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("SourceG2RpcServer is already running")
-        try:
-            os.unlink(self._socket_path)
-        except FileNotFoundError:
-            pass
+        if "://" not in self._socket_path:
+            try:
+                os.unlink(self._socket_path)
+            except FileNotFoundError:
+                pass
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.REP)
         self._sock.setsockopt(zmq.RCVTIMEO, self._recv_timeout_ms)
-        self._sock.bind(f"ipc://{self._socket_path}")
+        self._sock.bind(zmq_endpoint(self._socket_path))
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -162,9 +174,9 @@ class SourceG2RpcServer:
         )
         self._thread.start()
         logger.info(
-            "RemoteG2 source RPC bound at ipc://%s (source_worker_id=%d, "
+            "RemoteG2 source RPC bound at %s (source_worker_id=%d, "
             "source_dp_rank=%d)",
-            self._socket_path,
+            zmq_endpoint(self._socket_path),
             self._registry.source_worker_id,
             self._registry.source_dp_rank,
         )

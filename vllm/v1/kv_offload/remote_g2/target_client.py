@@ -85,7 +85,14 @@ class TargetG2RpcClient:
             sock.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
             sock.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
             sock.setsockopt(zmq.LINGER, 0)
-            sock.connect(f"ipc://{self._socket_path}")
+            # A bare path is a host-local ipc socket; a path with a scheme
+            # (e.g. tcp://host:port) is used verbatim for cross-node 2-pod runs.
+            endpoint = (
+                self._socket_path
+                if "://" in self._socket_path
+                else f"ipc://{self._socket_path}"
+            )
+            sock.connect(endpoint)
             self._sock = sock
         return self._sock
 
