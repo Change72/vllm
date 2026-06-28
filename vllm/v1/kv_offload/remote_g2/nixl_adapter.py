@@ -119,7 +119,7 @@ def build_source_agent(
         )
 
     try:
-        config = nixl_agent_config(True, True, 0, False, 0, list(backends))
+        config = nixl_agent_config(True, False, 0, False, 0, list(backends))
         agent = nixl_agent(agent_name, config, instantiate_all=False)
     except Exception:
         logger.exception("RemoteG2: nixl_agent construction failed")
@@ -213,7 +213,7 @@ class RawNixlRemoteG2Adapter:
             self._agent_metadata = _MockAgent.encode_metadata(agent_name)
             return
 
-        config = nixl_agent_config(True, True, 0, False, 0, list(backends))
+        config = nixl_agent_config(True, False, 0, False, 0, list(backends))
         self._agent = nixl_agent(agent_name, config, instantiate_all=False)
         reg_list = [
             (p, s, self._local_device_id, "")
