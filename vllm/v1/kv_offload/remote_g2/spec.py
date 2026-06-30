@@ -162,12 +162,12 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             )
         # TP topology. world_size is known at construction (it's a config
         # value); the actual rank is read lazily from get_tp_group() at
-        # get_handlers() time because torch.distributed may not be fully
+        # get_worker() time because torch.distributed may not be fully
         # initialised here. ``cpu_page_size_per_worker`` is already
         # computed by CPUOffloadingSpec.__init__ above (= the per-rank
         # byte size of one offloaded block, totalled across all layers).
         self.tp_size: int = vllm_config.parallel_config.tensor_parallel_size
-        self.tp_rank: int = -1  # resolved in get_handlers()
+        self.tp_rank: int = -1  # resolved in get_worker()/_setup_remote()
 
         extra = self.extra_config
         self.source_worker_id = _resolve_int(
@@ -224,7 +224,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         # first get_worker() call, once the CPU pool tensors exist.
         self._remote_initialized = False
         # Handshake-metadata state for TP>1 scheduler-coordinator path.
-        # Worker fills _handshake_payload during get_handlers and exposes
+        # Worker fills _handshake_payload during get_worker()/_setup_remote() and exposes
         # it via get_handshake_metadata. Scheduler caches the merged
         # per-rank dict in _per_rank_handshake when EngineCore calls
         # set_xfer_handshake_metadata, then starts/updates the source
@@ -261,7 +261,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             mgr.set_target_client_factory(self._build_target_client)
 
             # In TP=1 the scheduler and worker are the same process, so
-            # the worker's set_pool_layout call (in get_handlers) is
+            # the worker's set_pool_layout call (in get_worker()/_setup_remote()) is
             # observable from the scheduler manager's index too. In
             # TP>1 they are *separate processes* — the worker call only
             # populates that worker's local registry singleton, and the
@@ -276,7 +276,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             # the descriptor's debug nixl_memory_desc.ptr field; the
             # real READ on the target side uses the source NIXL agent's
             # registered memory (carried in the per-rank NixlSourceBundle).
-            # The worker-side get_handlers call later overwrites with
+            # The worker-side get_worker()/_setup_remote() call later overwrites with
             # real pointers within the worker process.
             if self.cpu_page_size_per_worker > 0:
                 try:
