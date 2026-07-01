@@ -11,7 +11,7 @@ The transfer handler must propagate this as a failed
 These tests pin down the contract end-to-end without standing up a
 real vLLM engine:
 
-* ``transfer_async`` returns True (it accepted the spec) but the
+* ``submit_load`` returns True (it accepted the spec) but the
   enqueued ``TransferResult.success`` is False after the failure.
 * ``get_finished`` returns the failed result exactly once.
 * Subsequent transfers after a failure recover (no stuck state).
@@ -22,7 +22,6 @@ real vLLM engine:
 from __future__ import annotations
 
 import ctypes
-from typing import Any
 
 import pytest
 
@@ -48,7 +47,9 @@ def _ptr_of(buf: bytearray) -> int:
 def _make_handler(
     *,
     fault_inject_every: int = 0,
-) -> tuple[RemoteG2TransferHandler, RawNixlRemoteG2Adapter, list[bytearray], list[bytearray]]:
+) -> tuple[
+    RemoteG2TransferHandler, RawNixlRemoteG2Adapter, list[bytearray], list[bytearray]
+]:
     src_pools = [bytearray(NUM_BLOCKS * PAGE_SIZE) for _ in range(NUM_LAYERS)]
     tgt_pools = [bytearray(NUM_BLOCKS * PAGE_SIZE) for _ in range(NUM_LAYERS)]
     for layer, pool in enumerate(src_pools):
@@ -84,7 +85,9 @@ def _make_handler(
     return handler, adapter, src_pools, tgt_pools
 
 
-def _spec_for(block_ids: list[int], lease_id: str = "L") -> tuple[RemoteG2LoadSpec, GPULoadStoreSpec]:
+def _spec_for(
+    block_ids: list[int], lease_id: str = "L"
+) -> tuple[RemoteG2LoadSpec, GPULoadStoreSpec]:
     blocks = [
         _RemoteBlockHandle(
             block_hash=1000 + bid,
@@ -112,7 +115,7 @@ def _spec_for(block_ids: list[int], lease_id: str = "L") -> tuple[RemoteG2LoadSp
 def test_happy_path_reports_success() -> None:
     handler, _adapter, src_pools, tgt_pools = _make_handler()
     src, dst = _spec_for([0, 1, 2, 3])
-    assert handler.transfer_async(101, (src, dst)) is True
+    assert handler.submit_load(101, src, dst) is True
     finished = handler.get_finished()
     assert len(finished) == 1
     r = finished[0]
@@ -129,7 +132,7 @@ def test_every_read_fails_returns_failure() -> None:
     in the job fails, the rest are skipped, success=False."""
     handler, _adapter, _src, _tgt = _make_handler(fault_inject_every=1)
     src, dst = _spec_for([0, 1])
-    assert handler.transfer_async(202, (src, dst)) is True
+    assert handler.submit_load(202, src, dst) is True
     finished = handler.get_finished()
     assert len(finished) == 1
     assert finished[0].job_id == 202
@@ -140,15 +143,13 @@ def test_one_failure_then_recovery() -> None:
     """fault_inject_every=3 -> 3rd / 6th / ... read fails. With 2
     blocks per job, jobs 1 and 2 (which together do 4 reads) include
     one failure; jobs 3+ should recover."""
-    handler, _adapter, src_pools, tgt_pools = _make_handler(
-        fault_inject_every=3
-    )
+    handler, _adapter, src_pools, tgt_pools = _make_handler(fault_inject_every=3)
 
     src1, dst1 = _spec_for([0, 1])
     src2, dst2 = _spec_for([2, 3])
 
-    handler.transfer_async(301, (src1, dst1))
-    handler.transfer_async(302, (src2, dst2))
+    handler.submit_load(301, src1, dst1)
+    handler.submit_load(302, src2, dst2)
     results = sorted(handler.get_finished(), key=lambda r: r.job_id)
     # At least one job must have failed (the read where the counter
     # hit a multiple of 3); the other completes successfully.
@@ -159,12 +160,12 @@ def test_one_failure_then_recovery() -> None:
 
     # Subsequent transfers complete cleanly (handler isn't stuck).
     src3, dst3 = _spec_for([0])
-    handler.transfer_async(303, (src3, dst3))
+    handler.submit_load(303, src3, dst3)
     # Need to issue enough additional successful reads so the counter
     # walks past the next multiple of 3 — adapter's counter is shared
     # across all read_block calls.
     src4, dst4 = _spec_for([1])
-    handler.transfer_async(304, (src4, dst4))
+    handler.submit_load(304, src4, dst4)
     later = sorted(handler.get_finished(), key=lambda r: r.job_id)
     assert all(r.job_id in {303, 304} for r in later)
 
@@ -173,7 +174,7 @@ def test_get_finished_is_idempotent_drain() -> None:
     """get_finished should drain results and return [] afterwards."""
     handler, _adapter, _src, _tgt = _make_handler()
     src, dst = _spec_for([0])
-    handler.transfer_async(401, (src, dst))
+    handler.submit_load(401, src, dst)
     first = handler.get_finished()
     second = handler.get_finished()
     assert len(first) == 1
@@ -187,7 +188,7 @@ def test_missing_peer_fails_gracefully() -> None:
     # Replace ensure_peer with one that always says no.
     handler._ensure_peer = lambda peer_name: False
     src, dst = _spec_for([0, 1])
-    assert handler.transfer_async(501, (src, dst)) is True
+    assert handler.submit_load(501, src, dst) is True
     results = handler.get_finished()
     assert len(results) == 1
     assert results[0].success is False
@@ -196,7 +197,7 @@ def test_missing_peer_fails_gracefully() -> None:
 
 def test_block_count_mismatch_rejected_synchronously() -> None:
     """Mismatched src/dst block counts is a programmer error; we
-    surface it via transfer_async returning False (rather than
+    surface it via submit_load returning False (rather than
     enqueueing a fake failure result)."""
     handler, _adapter, _src, _tgt = _make_handler()
     src, _dst = _spec_for([0, 1])
@@ -206,7 +207,7 @@ def test_block_count_mismatch_rejected_synchronously() -> None:
         group_sizes=[3],
         block_indices=[0],
     )
-    assert handler.transfer_async(601, (src, bad_dst)) is False
+    assert handler.submit_load(601, src, bad_dst) is False
     # No result enqueued — the caller never claimed acceptance.
     assert handler.get_finished() == []
 
@@ -216,7 +217,7 @@ def test_wrong_spec_types_rejected() -> None:
     # Wrong src type.
     bad_src = object()
     dst = GPULoadStoreSpec(block_ids=[0], group_sizes=[1], block_indices=[0])
-    assert handler.transfer_async(701, (bad_src, dst)) is False  # type: ignore[arg-type]
+    assert handler.submit_load(701, bad_src, dst) is False  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
