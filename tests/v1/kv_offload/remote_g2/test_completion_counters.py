@@ -60,14 +60,16 @@ def test_defaults_are_fail_closed() -> None:
 def test_record_completed_load_counts_and_ignores_nonpositive() -> None:
     reg = _fresh_registry()
     # No spec emitted for this request -> not a transfer -> no count.
-    assert reg.record_completed_load(0) is False
-    assert reg.record_completed_load(-5) is False
+    assert reg.record_completed_load(0, 42) is False
+    assert reg.record_completed_load(-5, 42) is False
     assert reg.plan_loads_completed == 0
     assert reg.plan_bytes_completed == 0
-    # A real completed load.
-    assert reg.record_completed_load(3 * 4096) is True
+    # A real completed load from source 42.
+    assert reg.record_completed_load(3 * 4096, 42) is True
     assert reg.plan_loads_completed == 1
     assert reg.plan_bytes_completed == 12288
+    assert reg.completed_loads_by_source == {42: 1}
+    assert reg.completed_bytes_by_source == {42: 12288}
 
 
 def test_no_double_count_on_refired_complete_load() -> None:
@@ -75,25 +77,53 @@ def test_no_double_count_on_refired_complete_load() -> None:
     re-fired complete_load passes 0 here and must not double-count."""
     reg = _fresh_registry()
     emitted = 5 * 4096
-    assert reg.record_completed_load(emitted) is True  # first completion
-    assert reg.record_completed_load(0) is False  # re-fire (tally zeroed)
+    assert reg.record_completed_load(emitted, 42) is True  # first completion
+    assert reg.record_completed_load(0, 42) is False  # re-fire (tally zeroed)
     assert reg.plan_loads_completed == 1
     assert reg.plan_bytes_completed == emitted
+    assert reg.completed_loads_by_source == {42: 1}
     # A genuinely new completion (next request) advances again.
-    assert reg.record_completed_load(2 * 4096) is True
+    assert reg.record_completed_load(2 * 4096, 42) is True
     assert reg.plan_loads_completed == 2
     assert reg.plan_bytes_completed == emitted + 2 * 4096
+    assert reg.completed_loads_by_source == {42: 2}
+
+
+def test_completions_bucketed_by_source() -> None:
+    """A gate must be able to prove every completion came from the expected
+    source; the per-source breakdown makes that checkable."""
+    reg = _fresh_registry()
+    reg.record_completed_load(4096, 100)  # from A
+    reg.record_completed_load(4096, 100)  # from A
+    reg.record_completed_load(4096, 200)  # from a different source
+    assert reg.completed_loads_by_source == {100: 2, 200: 1}
+    assert reg.completed_bytes_by_source == {100: 8192, 200: 4096}
+    res = _stats(reg)
+    # Stats surface string-keyed maps (JSON-friendly for the perf gate).
+    assert res["completed_loads_by_source"] == {"100": 2, "200": 1}
+    assert res["completed_bytes_by_source"] == {"100": 8192, "200": 4096}
 
 
 def test_completion_is_distinct_from_plan_time_blocks() -> None:
     reg = _fresh_registry()
     reg.plan_blocks_loaded += 3  # plan-time (proves nothing transferred)
-    reg.record_completed_load(3 * 4096)  # post-completion (proves it did)
+    reg.record_completed_load(3 * 4096, 100)  # post-completion (proves it did)
     ts = _stats(reg)["target_stats"]
     assert ts["plan_blocks_loaded"] == 3
     assert ts["plan_loads_completed"] == 1
     assert ts["plan_bytes_completed"] == 12288
     assert ts["plan_bytes_completed"] != ts["plan_blocks_loaded"]
+
+
+def test_boot_id_is_stable_and_surfaced() -> None:
+    """boot_id is stable for a registry instance (a gate compares before/
+    after to catch a mid-run restart) and distinct across instances."""
+    reg = _fresh_registry()
+    bid = reg.boot_id
+    assert bid and _stats(reg)["boot_id"] == bid
+    assert reg.boot_id == bid  # stable across reads
+    other = _fresh_registry()  # simulates a restart (fresh singleton)
+    assert other.boot_id != bid
 
 
 def test_stats_surface_all_gate_fields() -> None:
@@ -114,6 +144,9 @@ def test_stats_surface_all_gate_fields() -> None:
     assert res["transport_backend"] == "UCX"
     assert res["transport_mock"] is False
     assert isinstance(res["num_layers"], int)
+    assert isinstance(res["boot_id"], str) and res["boot_id"]
+    assert res["completed_loads_by_source"] == {}
+    assert res["completed_bytes_by_source"] == {}
 
 
 def test_set_transport_info_mock_is_visible() -> None:

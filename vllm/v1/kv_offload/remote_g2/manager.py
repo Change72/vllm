@@ -372,7 +372,9 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         # point (assert transfer_result.success), a positive bytes_emitted
         # here is proof the emitted transfer completed. Zero it after a
         # counted completion so a re-fired complete_load can't double-count.
-        if self.registry.record_completed_load(entry.bytes_emitted):
+        if self.registry.record_completed_load(
+            entry.bytes_emitted, entry.plan.source_worker_id
+        ):
             entry.bytes_emitted = 0
 
     def prepare_store(

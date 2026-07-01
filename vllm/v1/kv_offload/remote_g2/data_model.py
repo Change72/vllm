@@ -21,6 +21,7 @@ import contextlib
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -321,7 +322,20 @@ class SourceG2DescriptorRegistry:
         # so it is model-agnostic and not a fixed block-size estimate.
         self.plan_loads_completed: int = 0
         self.plan_bytes_completed: int = 0
-
+        # Same completions, broken down by the plan's source_worker_id, so a
+        # perf gate can prove every puller's completions came from the
+        # EXPECTED source (delta from A == N) and none leaked in from any
+        # other source (delta from others == 0). The aggregate counters
+        # above alone can't distinguish "16 loads all from A" from "8 from A
+        # + 8 from some other worker".
+        self.completed_loads_by_source: dict[int, int] = {}
+        self.completed_bytes_by_source: dict[int, int] = {}
+        # Per-process boot identifier: stable for this engine process,
+        # regenerated on restart. A fail-closed gate requires the before/
+        # after snapshots to carry the SAME boot_id, so a mid-run restart
+        # (which resets every counter to 0 and could regrow to before+N)
+        # cannot masquerade as a valid delta.
+        self.boot_id: str = uuid.uuid4().hex
         # Transport provenance for the target-side READ path, published by
         # the worker-side spec once the NIXL adapter is built. Defaults are
         # fail-closed (mock=True, backend "unset") so a perf gate that reads
@@ -438,22 +452,31 @@ class SourceG2DescriptorRegistry:
         self.transport_backend = str(backend)
         self.transport_mock = bool(mock)
 
-    def record_completed_load(self, bytes_emitted: int) -> bool:
+    def record_completed_load(self, bytes_emitted: int, source_worker_id: int) -> bool:
         """Count one completed plan-driven load. Returns whether it counted.
 
         Called from ``RemoteG2OffloadingManager.complete_load`` with the
         request's ``bytes_emitted`` (the descriptor byte_length sum for the
-        RemoteG2LoadSpec it actually emitted). A non-positive value means no
-        spec was emitted for this request (it fell back to the local path),
-        so nothing is counted -- this is what keeps a leased-but-fully-local
-        request from being scored as a transfer. The caller zeroes its
-        per-request tally after a True return so a re-fired ``complete_load``
-        passes 0 here and cannot double-count.
+        RemoteG2LoadSpec it actually emitted) and the plan's
+        ``source_worker_id``. A non-positive value means no spec was emitted
+        for this request (it fell back to the local path), so nothing is
+        counted -- this is what keeps a leased-but-fully-local request from
+        being scored as a transfer. The caller zeroes its per-request tally
+        after a True return so a re-fired ``complete_load`` passes 0 here and
+        cannot double-count. The per-source breakdown lets a gate assert the
+        transfer came from the expected source and no other.
         """
         if bytes_emitted <= 0:
             return False
+        sid = int(source_worker_id)
         self.plan_loads_completed += 1
         self.plan_bytes_completed += int(bytes_emitted)
+        self.completed_loads_by_source[sid] = (
+            self.completed_loads_by_source.get(sid, 0) + 1
+        )
+        self.completed_bytes_by_source[sid] = self.completed_bytes_by_source.get(
+            sid, 0
+        ) + int(bytes_emitted)
         return True
 
     @property

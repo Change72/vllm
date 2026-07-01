@@ -276,6 +276,19 @@ class SourceG2RpcServer:
                 ),
                 "transport_mock": bool(getattr(self._registry, "transport_mock", True)),
                 "num_layers": int(getattr(self._registry, "num_layers", 0)),
+                "boot_id": str(getattr(self._registry, "boot_id", "")),
+                "completed_loads_by_source": {
+                    str(k): int(v)
+                    for k, v in getattr(
+                        self._registry, "completed_loads_by_source", {}
+                    ).items()
+                },
+                "completed_bytes_by_source": {
+                    str(k): int(v)
+                    for k, v in getattr(
+                        self._registry, "completed_bytes_by_source", {}
+                    ).items()
+                },
                 "hash_to_key_count": len(self._registry._hash_to_key),
                 "policy_registered": self._registry._policy is not None,
             },
