@@ -99,9 +99,7 @@ def build_source_agent(
     if not layer_pool_base_ptrs:
         raise ValueError("layer_pool_base_ptrs must be non-empty")
     if len(layer_pool_base_ptrs) != len(layer_pool_size_bytes):
-        raise ValueError(
-            "layer_pool_base_ptrs / layer_pool_size_bytes length mismatch"
-        )
+        raise ValueError("layer_pool_base_ptrs / layer_pool_size_bytes length mismatch")
 
     if not NIXL_AVAILABLE or not backends:
         if not NIXL_AVAILABLE:
@@ -189,15 +187,14 @@ class RawNixlRemoteG2Adapter:
         if not local_layer_pool_base_ptrs:
             raise ValueError("local_layer_pool_base_ptrs must be non-empty")
         if len(local_layer_pool_base_ptrs) != len(local_layer_pool_size_bytes):
-            raise ValueError(
-                "local_layer_pool_base_ptrs / size_bytes length mismatch"
-            )
+            raise ValueError("local_layer_pool_base_ptrs / size_bytes length mismatch")
         self._agent_name = agent_name
         self._local_layer_bases = [int(p) for p in local_layer_pool_base_ptrs]
         self._local_layer_sizes = [int(s) for s in local_layer_pool_size_bytes]
         self._local_mem_type = local_mem_type
         self._local_device_id = int(local_device_id)
         self._poll_interval_s = float(poll_interval_s)
+        self._backends = tuple(backends)
         self._use_mock = use_mock or not NIXL_AVAILABLE or not backends
         self._peers: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -230,6 +227,24 @@ class RawNixlRemoteG2Adapter:
     def num_layers(self) -> int:
         return len(self._local_layer_bases)
 
+    @property
+    def use_mock(self) -> bool:
+        """True when transfers are host memcpy, not a real NIXL/UCX READ.
+
+        Set when the caller forced mock, NIXL is unavailable, or no backend
+        was requested (see __init__). A fail-closed perf gate must reject a
+        run where this is True -- mock memcpy still bumps the completion
+        counters but proves nothing about the network path.
+        """
+        return self._use_mock
+
+    @property
+    def transport_backend(self) -> str:
+        """Human-readable transport tag: "MOCK" or the NIXL backend list."""
+        if self._use_mock:
+            return "MOCK"
+        return ",".join(self._backends) if self._backends else "MOCK"
+
     def add_peer(
         self,
         peer_name: str,
@@ -244,9 +259,7 @@ class RawNixlRemoteG2Adapter:
         if not peer_layer_pool_base_ptrs:
             raise ValueError("peer_layer_pool_base_ptrs must be non-empty")
         if len(peer_layer_pool_base_ptrs) != len(peer_layer_pool_size_bytes):
-            raise ValueError(
-                "peer_layer_pool_base_ptrs / size_bytes length mismatch"
-            )
+            raise ValueError("peer_layer_pool_base_ptrs / size_bytes length mismatch")
         if len(peer_layer_pool_base_ptrs) != self.num_layers:
             raise ValueError(
                 f"peer has {len(peer_layer_pool_base_ptrs)} layers but "
@@ -353,8 +366,7 @@ class RawNixlRemoteG2Adapter:
         while not self._agent.check_remote_metadata(peer["handle"]):
             if time.monotonic() > deadline:
                 raise RuntimeError(
-                    f"timed out waiting for remote metadata of peer "
-                    f"{peer_name!r}"
+                    f"timed out waiting for remote metadata of peer {peer_name!r}"
                 )
             time.sleep(self._poll_interval_s)
 
@@ -402,7 +414,7 @@ class _MockAgent:
 
     @staticmethod
     def encode_metadata(agent_name: str) -> bytes:
-        return f"mock:{agent_name}".encode("utf-8")
+        return f"mock:{agent_name}".encode()
 
 
 def _build_mock_source_bundle(

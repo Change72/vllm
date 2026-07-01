@@ -24,7 +24,7 @@ bundle yet, retry on next plan" so the gating is graceful.
 
 from __future__ import annotations
 
-import base64
+import contextlib
 import dataclasses
 import os
 import pickle
@@ -32,6 +32,7 @@ import threading
 from collections.abc import Mapping
 from typing import Any, Protocol
 
+import pybase64 as base64
 import zmq
 
 from vllm.logger import init_logger
@@ -59,9 +60,7 @@ def _result_to_dict(result: RemoteG2ResolveResult) -> dict[str, Any]:
         "num_tokens": result.num_tokens,
         "reason": result.reason,
         "source_generation": result.source_generation,
-        "per_block_status": [
-            dataclasses.asdict(s) for s in result.per_block_status
-        ],
+        "per_block_status": [dataclasses.asdict(s) for s in result.per_block_status],
     }
 
 
@@ -149,9 +148,7 @@ class SourceG2RpcServer:
     def socket_path(self) -> str:
         return self._socket_path
 
-    def set_nixl_bundle_provider(
-        self, provider: Any
-    ) -> None:
+    def set_nixl_bundle_provider(self, provider: Any) -> None:
         """Register a zero-arg callable returning a NixlSourceBundle.
 
         Called once the NIXL agent + registered pool are ready (M3).
@@ -175,10 +172,8 @@ class SourceG2RpcServer:
         if self._thread is not None:
             raise RuntimeError("SourceG2RpcServer is already running")
         if "://" not in self._socket_path:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.unlink(self._socket_path)
-            except FileNotFoundError:
-                pass
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.REP)
         self._sock.setsockopt(zmq.RCVTIMEO, self._recv_timeout_ms)
@@ -191,8 +186,7 @@ class SourceG2RpcServer:
         )
         self._thread.start()
         logger.info(
-            "RemoteG2 source RPC bound at %s (source_worker_id=%d, "
-            "source_dp_rank=%d)",
+            "RemoteG2 source RPC bound at %s (source_worker_id=%d, source_dp_rank=%d)",
             zmq_endpoint(self._socket_path),
             self._registry.source_worker_id,
             self._registry.source_dp_rank,
@@ -209,10 +203,8 @@ class SourceG2RpcServer:
             except Exception:
                 logger.warning("Failed closing RemoteG2 RPC socket", exc_info=True)
             self._sock = None
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(self._socket_path)
-        except FileNotFoundError:
-            pass
 
     def _run(self) -> None:
         assert self._sock is not None
@@ -262,6 +254,8 @@ class SourceG2RpcServer:
             "plan_resolved_count",
             "plan_load_specs_emitted",
             "plan_blocks_loaded",
+            "plan_loads_completed",
+            "plan_bytes_completed",
         ):
             target_stats[attr] = int(getattr(self._registry, attr, 0))
         return {
@@ -277,6 +271,11 @@ class SourceG2RpcServer:
                 "pin_count_total": int(self._registry.pin_count_total),
                 "unpin_count_total": int(self._registry.unpin_count_total),
                 "pin_failures": int(self._registry.pin_failures),
+                "transport_backend": str(
+                    getattr(self._registry, "transport_backend", "unset")
+                ),
+                "transport_mock": bool(getattr(self._registry, "transport_mock", True)),
+                "num_layers": int(getattr(self._registry, "num_layers", 0)),
                 "hash_to_key_count": len(self._registry._hash_to_key),
                 "policy_registered": self._registry._policy is not None,
             },
@@ -310,8 +309,8 @@ class SourceG2RpcServer:
                 bundle = self._per_rank_bundle_provider(int(tp_rank))
             except Exception:
                 logger.exception(
-                    "RemoteG2 per-rank bundle provider raised "
-                    "(tp_rank=%s)", tp_rank,
+                    "RemoteG2 per-rank bundle provider raised (tp_rank=%s)",
+                    tp_rank,
                 )
                 bundle = None
         if bundle is None and self._bundle_provider is not None:
@@ -331,7 +330,9 @@ class SourceG2RpcServer:
                     loaded_name = agent.add_remote_agent(peer_bytes)
                     logger.info(
                         "RemoteG2 source add_remote_agent loaded peer "
-                        "name=%s (bytes=%d)", loaded_name, len(peer_bytes),
+                        "name=%s (bytes=%d)",
+                        loaded_name,
+                        len(peer_bytes),
                     )
             except Exception:
                 logger.exception("RemoteG2 source add_remote_agent failed")
@@ -343,9 +344,9 @@ class SourceG2RpcServer:
                 "source_dp_rank": self._registry.source_dp_rank,
                 "source_generation": bundle.source_generation,
                 "remote_name": bundle.remote_name,
-                "agent_metadata_b64": base64.b64encode(
-                    bundle.agent_desc
-                ).decode("ascii"),
+                "agent_metadata_b64": base64.b64encode(bundle.agent_desc).decode(
+                    "ascii"
+                ),
                 # Legacy single-pool fields (= layer 0 in multi-layer
                 # mode). Kept for TRT-LLM-compatible peers.
                 "pool_base_ptr": bundle.pool_base_ptr,
@@ -361,9 +362,7 @@ class SourceG2RpcServer:
 
     # Convenience for direct metadata lookups (vLLM-internal use, not
     # part of the TRT-LLM-compatible wire surface).
-    def lookup_descriptor(
-        self, block_hash: int
-    ) -> dict[str, Any] | None:
+    def lookup_descriptor(self, block_hash: int) -> dict[str, Any] | None:
         record = self._registry.get_descriptor(int(block_hash))
         if record is None or not record.live:
             return None

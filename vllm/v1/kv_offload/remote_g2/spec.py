@@ -546,6 +546,13 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             # The connector drives a single worker per spec; route
             # RemoteG2LoadSpec loads to this handler from submit_load.
             worker.remote_handler = self._transfer_handler
+            # Publish the READ transport to the shared registry so the
+            # stats RPC (and the fail-closed perf gate) can reject a run
+            # that silently fell back to mock memcpy (NIXL unavailable).
+            manager.registry.set_transport_info(
+                backend=self._target_adapter.transport_backend,
+                mock=self._target_adapter.use_mock,
+            )
 
     def shutdown(self) -> None:
         if self._rpc_server is not None:

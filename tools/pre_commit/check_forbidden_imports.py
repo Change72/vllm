@@ -49,6 +49,7 @@ CHECK_IMPORTS = {
             # (target client <-> source REP server), mirroring the same pattern
             # used elsewhere in the codebase (e.g. serial_utils, shm_broadcast).
             "vllm/v1/kv_offload/remote_g2/target_client.py",
+            "vllm/v1/kv_offload/remote_g2/source_rpc.py",
             "tests/v1/kv_offload/remote_g2/test_dynamic_bridge.py",
             "benchmarks/kernels/graph_machete_bench.py",
             "benchmarks/kernels/benchmark_lora.py",

@@ -17,6 +17,7 @@ with vLLM-specific simplifications:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -142,9 +143,7 @@ class RemoteKvReusePlan:
             block_size_tokens=int(data["block_size_tokens"]),
             created_at_ms=int(data["created_at_ms"]),
             expires_at_ms=int(data["expires_at_ms"]),
-            plan_version=int(
-                data.get("plan_version", REMOTE_KV_REUSE_PLAN_VERSION)
-            ),
+            plan_version=int(data.get("plan_version", REMOTE_KV_REUSE_PLAN_VERSION)),
         )
 
     def is_remote_g2(self) -> bool:
@@ -310,6 +309,28 @@ class SourceG2DescriptorRegistry:
         self.plan_resolved_count: int = 0
         self.plan_load_specs_emitted: int = 0
         self.plan_blocks_loaded: int = 0
+        # Post-completion counters (incremented in ``complete_load`` ONLY
+        # for requests that actually emitted a RemoteG2LoadSpec, i.e. a
+        # real NIXL READ). Because a failed READ trips the
+        # ``assert transfer_result.success`` in the offloading worker and
+        # crashes the engine step *before* ``complete_load`` runs, reaching
+        # these increments proves the emitted transfer completed — unlike
+        # the plan-time ``plan_blocks_loaded`` above, which only proves a
+        # spec was prepared. ``plan_bytes_completed`` sums the descriptors'
+        # own ``byte_length`` (the exact amount the transfer handler moves),
+        # so it is model-agnostic and not a fixed block-size estimate.
+        self.plan_loads_completed: int = 0
+        self.plan_bytes_completed: int = 0
+
+        # Transport provenance for the target-side READ path, published by
+        # the worker-side spec once the NIXL adapter is built. Defaults are
+        # fail-closed (mock=True, backend "unset") so a perf gate that reads
+        # these over the stats RPC rejects a run until a real NIXL/UCX
+        # adapter has reported in. (Layer count is exposed separately via
+        # the existing ``num_layers`` property, from the pool layout, so the
+        # gate can convert single-layer logical bytes into approx wire bytes.)
+        self.transport_backend: str = "unset"
+        self.transport_mock: bool = True
 
         # Source-side eviction protection. The CPUOffloadingManager's
         # policy enforces eviction by ref_cnt and a per-call ``protected``
@@ -404,14 +425,36 @@ class SourceG2DescriptorRegistry:
             self._device_id = int(device_id)
 
     def pool_layout_ready(self) -> bool:
-        return (
-            bool(self._layer_pool_base_ptrs)
-            and self._page_size_bytes > 0
-        )
+        return bool(self._layer_pool_base_ptrs) and self._page_size_bytes > 0
 
     @property
     def num_layers(self) -> int:
         return len(self._layer_pool_base_ptrs)
+
+    def set_transport_info(self, *, backend: str, mock: bool) -> None:
+        """Record the target-side READ transport (called by the spec once
+        the NIXL adapter is built). Read back over the stats RPC by the
+        fail-closed perf gate to reject a mock-memcpy fallback."""
+        self.transport_backend = str(backend)
+        self.transport_mock = bool(mock)
+
+    def record_completed_load(self, bytes_emitted: int) -> bool:
+        """Count one completed plan-driven load. Returns whether it counted.
+
+        Called from ``RemoteG2OffloadingManager.complete_load`` with the
+        request's ``bytes_emitted`` (the descriptor byte_length sum for the
+        RemoteG2LoadSpec it actually emitted). A non-positive value means no
+        spec was emitted for this request (it fell back to the local path),
+        so nothing is counted -- this is what keeps a leased-but-fully-local
+        request from being scored as a transfer. The caller zeroes its
+        per-request tally after a True return so a re-fired ``complete_load``
+        passes 0 here and cannot double-count.
+        """
+        if bytes_emitted <= 0:
+            return False
+        self.plan_loads_completed += 1
+        self.plan_bytes_completed += int(bytes_emitted)
+        return True
 
     @property
     def layer_pool_base_ptrs(self) -> list[int]:
@@ -444,8 +487,7 @@ class SourceG2DescriptorRegistry:
             if not self.pool_layout_ready():
                 return None
             byte_offset = (
-                block_id * self._row_stride_bytes
-                + self._rank * self._page_size_bytes
+                block_id * self._row_stride_bytes + self._rank * self._page_size_bytes
             )
             gen = self._descriptor_generation_counter.get(block_hash_int, 0) + 1
             self._descriptor_generation_counter[block_hash_int] = gen
@@ -611,9 +653,7 @@ class SourceG2DescriptorRegistry:
             if record is not None:
                 record.live = False
 
-    def get_descriptor(
-        self, block_hash: int
-    ) -> SourceG2DescriptorRecord | None:
+    def get_descriptor(self, block_hash: int) -> SourceG2DescriptorRecord | None:
         with self._lock:
             return self._records.get(int(block_hash))
 
@@ -623,9 +663,7 @@ class SourceG2DescriptorRegistry:
         # don't collide on the lease_id key. Counter is protected by
         # ``self._lock``, which the caller is expected to hold.
         self._lease_id_counter += 1
-        return (
-            f"{plan_id}:{request_id}:{self._clock_ms()}:{self._lease_id_counter}"
-        )
+        return f"{plan_id}:{request_id}:{self._clock_ms()}:{self._lease_id_counter}"
 
     def resolve_and_lease(
         self, plan: Mapping[str, Any] | RemoteKvReusePlan
@@ -717,9 +755,7 @@ class SourceG2DescriptorRegistry:
                         # Roll back the policy pin we just took.
                         self._unpin_block_locked(kv_hash)
                         per_block_status.append(
-                            RemoteG2BlockStatus(
-                                int(identity_hash), "pin_failed"
-                            )
+                            RemoteG2BlockStatus(int(identity_hash), "pin_failed")
                         )
                         break
                 record.lease_count += 1
@@ -761,10 +797,8 @@ class SourceG2DescriptorRegistry:
                 # release_pin callback for any external pins we held.
                 if self._release_pin is not None:
                     for ref in pin_refs:
-                        try:
+                        with contextlib.suppress(Exception):
                             self._release_pin(ref)
-                        except Exception:
-                            pass
                 pinned_hashes = []
                 pin_refs = []
 
@@ -817,10 +851,8 @@ class SourceG2DescriptorRegistry:
                 # with the pin we took in resolve_and_lease.
                 self._unpin_block_locked(int(block_hash))
                 if self._release_pin is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._release_pin(pin_ref)
-                    except Exception:
-                        pass
             return True
 
     def expire_stale_leases(self, now_ms: int | None = None) -> int:

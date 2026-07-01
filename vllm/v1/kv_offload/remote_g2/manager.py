@@ -325,6 +325,11 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
 
         self.registry.plan_load_specs_emitted += 1
         self.registry.plan_blocks_loaded += len(handles)
+        # Track the bytes this spec will actually READ so ``complete_load``
+        # can attribute them to a *completed* transfer (see counter docs in
+        # data_model.py). Summed from descriptor byte_length == the exact
+        # amount the transfer handler moves per block.
+        entry.bytes_emitted += sum(int(h.byte_length) for h in handles)
         logger.debug(
             "RemoteG2: req %s prepare_load -> RemoteG2LoadSpec "
             "(%d blocks, lease=%s, source_worker_id=%d)",
@@ -358,6 +363,17 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         if entry is None or entry.result.lease_id is None:
             with self._rlock:
                 super().complete_load(keys, req_context)
+            return
+        # Reaching here means the request was plan-driven AND leased. Only
+        # count it as a completed transfer if ``prepare_load`` actually
+        # emitted a RemoteG2LoadSpec for it (bytes_emitted > 0); a leased
+        # request whose keys turned out to be fully local never emitted a
+        # READ. Because a failed READ crashes the engine step before this
+        # point (assert transfer_result.success), a positive bytes_emitted
+        # here is proof the emitted transfer completed. Zero it after a
+        # counted completion so a re-fired complete_load can't double-count.
+        if self.registry.record_completed_load(entry.bytes_emitted):
+            entry.bytes_emitted = 0
 
     def prepare_store(
         self,
@@ -469,3 +485,8 @@ class _ResolveCacheEntry:
     result: RemoteG2ResolveResult
     descriptor_by_hash: dict[int, RemoteG2Descriptor]
     client: _TargetClient
+    # Bytes for which ``prepare_load`` actually emitted a RemoteG2LoadSpec
+    # (a real NIXL READ), summed from descriptor ``byte_length``. Rolled
+    # into the registry's post-completion counters by ``complete_load`` and
+    # then zeroed, so re-fired completions never double-count.
+    bytes_emitted: int = 0
