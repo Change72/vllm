@@ -16,7 +16,6 @@ to the source's Unix domain socket.
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import os
 import pickle
@@ -24,6 +23,7 @@ import threading
 from collections.abc import Mapping
 from typing import Any
 
+import pybase64 as base64
 import zmq
 
 from vllm.logger import init_logger
@@ -205,13 +205,9 @@ class TargetG2RpcClient:
         return _result_from_wire(reply["result"])
 
     def release_lease(self, lease_id: str, reason: str = "ack") -> bool:
-        reply = self._request(
-            "release_lease", {"lease_id": lease_id, "reason": reason}
-        )
+        reply = self._request("release_lease", {"lease_id": lease_id, "reason": reason})
         if not reply.get("ok"):
-            logger.warning(
-                "RemoteG2 release_lease failed: %s", reply.get("error")
-            )
+            logger.warning("RemoteG2 release_lease failed: %s", reply.get("error"))
             return False
         return bool(reply.get("result"))
 
@@ -243,20 +239,16 @@ class TargetG2RpcClient:
         """
         payload: dict[str, Any] = {}
         if peer_agent_metadata is not None:
-            payload["peer_metadata_b64"] = base64.b64encode(
-                peer_agent_metadata
-            ).decode("ascii")
+            payload["peer_metadata_b64"] = base64.b64encode(peer_agent_metadata).decode(
+                "ascii"
+            )
         if tp_rank is not None:
             payload["tp_rank"] = int(tp_rank)
         reply = self._request("get_metadata", payload)
         if not reply.get("ok"):
-            logger.debug(
-                "RemoteG2 get_metadata not ready: %s", reply.get("error")
-            )
+            logger.debug("RemoteG2 get_metadata not ready: %s", reply.get("error"))
             return None
         result = dict(reply["result"])
         if isinstance(result.get("agent_metadata_b64"), str):
-            result["agent_metadata"] = base64.b64decode(
-                result["agent_metadata_b64"]
-            )
+            result["agent_metadata"] = base64.b64decode(result["agent_metadata_b64"])
         return result

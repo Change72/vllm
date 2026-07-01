@@ -45,8 +45,10 @@ CHECK_IMPORTS = {
             "tests/tokenizers_/test_hf.py",
             "tests/utils_/test_hashing.py",
             "tests/compile/test_aot_compile.py",
-            # Remote-G2 dynamic-bridge wire test inspects the pickle envelope
-            # the target client sends (the KV-P2P IPC protocol is pickle).
+            # Remote-G2 KV-P2P uses pickle for its host-local IPC control wire
+            # (target client <-> source REP server), mirroring the same pattern
+            # used elsewhere in the codebase (e.g. serial_utils, shm_broadcast).
+            "vllm/v1/kv_offload/remote_g2/target_client.py",
             "tests/v1/kv_offload/remote_g2/test_dynamic_bridge.py",
             "benchmarks/kernels/graph_machete_bench.py",
             "benchmarks/kernels/benchmark_lora.py",

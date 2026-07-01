@@ -8,6 +8,7 @@ injected into every payload, and the vLLM NIXL-handshake fields
 (``peer_metadata_b64`` + ``tp_rank``) are forwarded. No real ZMQ round-trip: a
 fake socket captures the pickled request and returns a canned reply.
 """
+
 import pickle
 
 import pybase64 as base64
@@ -146,8 +147,6 @@ def test_direct_mode_keeps_long_verbs_and_no_source_worker_id():
 
 
 def test_target_bridge_socket_path_uses_parent_pid():
-    assert (
-        target_bridge_socket_path(1234) == "/tmp/dynamo_remote_g2_target_1234.sock"
-    )
+    assert target_bridge_socket_path(1234) == "/tmp/dynamo_remote_g2_target_1234.sock"
     # No arg -> getppid()-derived, still the canonical shape.
     assert target_bridge_socket_path().startswith("/tmp/dynamo_remote_g2_target_")

@@ -188,9 +188,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             device_id=self._device_id,
         )
 
-    def set_target_client_factory(
-        self, factory: TargetClientFactory
-    ) -> None:
+    def set_target_client_factory(self, factory: TargetClientFactory) -> None:
         self._target_client_factory = factory
 
     # --- plan-aware lookup ---
@@ -245,9 +243,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         entry = _ResolveCacheEntry(
             plan=plan,
             result=result,
-            descriptor_by_hash={
-                d.block_hash: d for d in result.descriptors
-            },
+            descriptor_by_hash={d.block_hash: d for d in result.descriptors},
             client=client,
         )
         self._resolve_cache[req_context.req_id] = entry
@@ -264,8 +260,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             )
         else:
             logger.debug(
-                "RemoteG2: req %s plan %s resolve returned no descriptors "
-                "(reason=%s)",
+                "RemoteG2: req %s plan %s resolve returned no descriptors (reason=%s)",
                 req_context.req_id,
                 plan.plan_id,
                 result.reason,
@@ -311,9 +306,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         handles: list[_RemoteBlockHandle] = []
         all_remote = True
         for key in keys:
-            block_hash_int = block_hash_to_router_int(
-                get_offload_block_hash(key)
-            )
+            block_hash_int = block_hash_to_router_int(get_offload_block_hash(key))
             desc = entry.descriptor_by_hash.get(block_hash_int)
             if desc is None:
                 all_remote = False
@@ -401,15 +394,11 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             if success:
                 self._upsert_descriptors_locked(keys)
 
-    def touch(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
-    ) -> None:
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         with self._rlock:
             super().touch(keys, req_context)
 
-    def on_new_request(
-        self, req_context: ReqContext
-    ) -> RequestOffloadingContext:
+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return super().on_new_request(req_context)
 
     def on_request_finished(self, req_context: ReqContext) -> None:
@@ -445,18 +434,14 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
 
     # --- registry population (must be called with _rlock held) ---
 
-    def _upsert_descriptors_locked(
-        self, keys: Iterable[OffloadKey]
-    ) -> None:
+    def _upsert_descriptors_locked(self, keys: Iterable[OffloadKey]) -> None:
         if not self.registry.pool_layout_ready():
             return
         for key in keys:
             block = self._policy.get(key)
             if block is None or not block.is_ready:
                 continue
-            block_hash_int = block_hash_to_router_int(
-                get_offload_block_hash(key)
-            )
+            block_hash_int = block_hash_to_router_int(get_offload_block_hash(key))
             # Record (block_hash → key) so the registry can resolve a
             # pin request back to a policy block. Must happen BEFORE
             # upsert_for_block makes the descriptor visible to peers,
@@ -470,9 +455,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
 
 
 class _TargetClient(Protocol):
-    def resolve_and_lease(
-        self, plan: RemoteKvReusePlan
-    ) -> RemoteG2ResolveResult: ...
+    def resolve_and_lease(self, plan: RemoteKvReusePlan) -> RemoteG2ResolveResult: ...
 
     def release_lease(self, lease_id: str, reason: str = ...) -> bool: ...
 
