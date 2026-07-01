@@ -7,9 +7,14 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+    _TransferMetricName,
+)
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
-from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, DmaCopyEvent
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -46,9 +51,12 @@ class SimpleCPUOffloadWorker:
 
         self._backend = DmaCopyBackend()
 
-        # Ordered (event_idx, Event). Events pre-allocated on main thread.
-        self._load_events: list[tuple[int, torch.Event]] = []
-        self._store_events: list[tuple[int, torch.Event]] = []
+        # Ordered completed/in-flight copies (each carries timing events + bytes),
+        # appended by the copy thread and consumed here on the worker thread.
+        self._load_events: list[DmaCopyEvent] = []
+        self._store_events: list[DmaCopyEvent] = []
+        # Transfer stats (bytes/time/size), recorded on completion; reset on read.
+        self._stats = OffloadingConnectorStats()
         # High-water marks: highest event_idx completed per stream.
         # When the event list is empty, the hwm covers all prior events.
         self._load_hwm: int = -1
@@ -286,14 +294,18 @@ class SimpleCPUOffloadWorker:
 
     def _flush_and_sync_all(self) -> None:
         """Synchronize all in-flight transfer events."""
-        for event_idx, event in self._load_events:
-            event.synchronize()
-            self._load_hwm = event_idx
+        for copy_event in self._load_events:
+            copy_event.end_event.synchronize()
+            self._record_transfer(copy_event)
+            self._release_event(copy_event)
+            self._load_hwm = copy_event.event_idx
         self._load_events.clear()
 
-        for event_idx, event in self._store_events:
-            event.synchronize()
-            self._store_hwm = event_idx
+        for copy_event in self._store_events:
+            copy_event.end_event.synchronize()
+            self._record_transfer(copy_event)
+            self._release_event(copy_event)
+            self._store_hwm = copy_event.event_idx
         self._store_events.clear()
 
     def _poll_stream_events(self, is_store: bool) -> int:
@@ -301,13 +313,50 @@ class SimpleCPUOffloadWorker:
         events = self._store_events if is_store else self._load_events
         hwm = self._store_hwm if is_store else self._load_hwm
         while events:
-            event_idx, event = events[0]
-            if not event.query():
+            copy_event = events[0]
+            if not copy_event.end_event.query():
                 break
-            hwm = event_idx
+            self._record_transfer(copy_event)
+            self._release_event(copy_event)
+            hwm = copy_event.event_idx
             events.pop(0)
         if is_store:
             self._store_hwm = hwm
         else:
             self._load_hwm = hwm
         return hwm
+
+    @staticmethod
+    def _release_event(copy_event: DmaCopyEvent) -> None:
+        if copy_event.release is not None:
+            copy_event.release()
+            copy_event.release = None
+
+    def _record_transfer(self, copy_event: DmaCopyEvent) -> None:
+        """Record a completed transfer's bytes/time/size into the stats payload.
+
+        Both timing events are complete here (end queried/synchronized, start
+        precedes it in stream order), so ``elapsed_time`` is safe. The bracket
+        is the DMA only; ``elapsed_time`` is in ms, converted to seconds.
+        """
+        if copy_event.num_bytes <= 0:
+            return
+        seconds = copy_event.start_event.elapsed_time(copy_event.end_event) * 1e-3
+        if copy_event.is_store:
+            bytes_name = _TransferMetricName.STORE_BYTES
+            time_name = _TransferMetricName.STORE_TIME
+            size_name = _TransferMetricName.STORE_SIZE
+        else:
+            bytes_name = _TransferMetricName.LOAD_BYTES
+            time_name = _TransferMetricName.LOAD_TIME
+            size_name = _TransferMetricName.LOAD_SIZE
+        self._stats.increase_counter(bytes_name, copy_event.num_bytes)
+        self._stats.increase_counter(time_name, seconds)
+        self._stats.observe_histogram(size_name, copy_event.num_bytes)
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        """Return transfer stats since the last call, then reset."""
+        if self._stats.is_empty():
+            return None
+        stats, self._stats = self._stats, OffloadingConnectorStats()
+        return stats

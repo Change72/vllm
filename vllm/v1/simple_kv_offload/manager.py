@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING, Any
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -28,6 +32,7 @@ from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
 )
+from vllm.v1.simple_kv_offload.metrics import PoolMetricName
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -775,6 +780,30 @@ class SimpleCPUOffloadScheduler:
         return bool(
             self._store_event_to_blocks or self._abandoned_store_event_to_blocks
         )
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        """Snapshot CPU pool utilization and pending-transfer gauges."""
+        pool = self.cpu_block_pool
+        # BlockPool reserves block id 0 as the null block (see BlockPool),
+        # so usable capacity is num_gpu_blocks - 1.
+        total_blocks = max(0, pool.num_gpu_blocks - 1)
+        free_blocks = pool.get_num_free_blocks()
+        used_blocks = max(0, total_blocks - free_blocks)
+        usage = used_blocks / total_blocks if total_blocks else 0.0
+        stats = OffloadingConnectorStats()
+        stats.set_gauge(PoolMetricName.TOTAL_BLOCKS, total_blocks)
+        stats.set_gauge(PoolMetricName.FREE_BLOCKS, free_blocks)
+        stats.set_gauge(PoolMetricName.USED_BLOCKS, used_blocks)
+        stats.set_gauge(PoolMetricName.USAGE_PERC, usage)
+        # Include abandoned (post-reset, still-draining) transfers so these
+        # agree with has_pending_stores().
+        pending_loads = len(self._reqs_to_load) + len(self._abandoned_reqs_to_load)
+        pending_stores = len(self._store_event_to_blocks) + len(
+            self._abandoned_store_event_to_blocks
+        )
+        stats.set_gauge(PoolMetricName.PENDING_LOADS, pending_loads)
+        stats.set_gauge(PoolMetricName.PENDING_STORES, pending_stores)
+        return stats
 
     def request_finished(
         self,

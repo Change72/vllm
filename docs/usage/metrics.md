@@ -45,6 +45,34 @@ The following metrics are exposed:
 
 --8<-- "docs/generated/metrics/nixl_connector.inc.md"
 
+## SimpleCPU KV Offload Metrics
+
+When `SimpleCPUOffloadConnector` is enabled, vLLM reports KV transfer volume and
+timing through the shared `vllm:kv_offload_*` metric family:
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `vllm:kv_offload_store_bytes` | Counter | Bytes stored GPU→CPU. |
+| `vllm:kv_offload_store_time` | Counter | Store time GPU→CPU, in seconds. |
+| `vllm:kv_offload_store_size` | Histogram | Store operation size, in bytes. |
+| `vllm:kv_offload_load_bytes` | Counter | Bytes loaded CPU→GPU. |
+| `vllm:kv_offload_load_time` | Counter | Load time CPU→GPU, in seconds. |
+| `vllm:kv_offload_load_size` | Histogram | Load operation size, in bytes. |
+
+It also reports the state of its CPU block pool:
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `vllm:simple_cpu_offload_total_blocks` | Gauge | Total usable CPU KV cache blocks. |
+| `vllm:simple_cpu_offload_free_blocks` | Gauge | Free usable CPU KV cache blocks. |
+| `vllm:simple_cpu_offload_used_blocks` | Gauge | Used usable CPU KV cache blocks. |
+| `vllm:simple_cpu_offload_usage_perc` | Gauge | CPU KV cache usage; `1` means 100 percent. |
+| `vllm:simple_cpu_offload_pending_loads` | Gauge | Requests with pending CPU→GPU loads. |
+| `vllm:simple_cpu_offload_pending_stores` | Gauge | Store events pending worker completion. |
+
+Load (`CPU_to_GPU`) samples appear only when a workload replays after GPU cache
+eviction; a workload that fits in the GPU KV cache may show stores only.
+
 ## Model Flops Utilization (MFU) Performance Metrics
 
 These metrics are available via `--enable-mfu-metrics`:

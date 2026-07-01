@@ -15,6 +15,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+    OffloadPromMetrics,
+    get_connector_metric_definitions,
+)
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -24,6 +35,7 @@ from vllm.v1.simple_kv_offload.manager import (
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
 )
+from vllm.v1.simple_kv_offload.metrics import get_pool_gauge_definitions
 from vllm.v1.simple_kv_offload.worker import (
     SimpleCPUOffloadWorker,
 )
@@ -40,6 +52,54 @@ logger = init_logger(__name__)
 
 # Default CPU capacity: 8 GB
 DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
+
+
+class SimpleCPUOffloadPromMetrics(OffloadPromMetrics):
+    """Prometheus metrics for SimpleCPUOffloadConnector.
+
+    Reuses OffloadPromMetrics' generic recording machinery (``observe`` and the
+    per-metric-name dispatch) but registers only the shared transfer metrics
+    plus this connector's CPU-pool gauges. It deliberately skips the native
+    ``OffloadPromMetrics.__init__``: that path is bound to the native offloading
+    spec factory and emits the deprecated ``vllm:kv_offload_total_*`` series,
+    neither of which apply to this connector.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        KVConnectorPromMetrics.__init__(
+            self, vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
+        # Deprecated transfer_type metrics belong to the native CPU spec only.
+        self._observe_deprecated_metrics = False
+        # Unused while _observe_deprecated_metrics is False; kept for safety
+        # since the inherited recording methods reference them behind the flag.
+        self.histogram_transfer_size = {}
+        self.counter_kv_bytes = {}
+        self.counter_kv_transfer_time = {}
+        # Shared transfer metric defs + this connector's CPU-pool gauges.
+        self._offloading_metric_metadata = {
+            **get_connector_metric_definitions(),
+            **get_pool_gauge_definitions(),
+        }
+        self.offloading_metrics = {}
+        # NOTE: the shared vllm:kv_offload_* transfer collectors are registered
+        # here as well as by the native OffloadingConnector. MultiConnector
+        # dedupes by connector class, so pairing this connector with the native
+        # OffloadingConnector (two implementations of the same CPU-offload
+        # feature) would register these names twice and fail with a
+        # "Duplicated timeseries" error. That pairing is not a sensible config;
+        # sharing the transfer collectors across the offload family is left as a
+        # follow-up.
+        self._offloading_metric_defs = {
+            metric_name: self._create_metric(metric_name, metadata)
+            for metric_name, metadata in self._offloading_metric_metadata.items()
+        }
 
 
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
@@ -170,6 +230,39 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.worker_handler is not None:
             return self.worker_handler.build_connector_worker_meta()
         return None
+
+    # --- Metrics ---
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        # Worker role reports transfer bytes/time; scheduler role reports the
+        # CPU pool gauges. The framework aggregates the two.
+        if self.worker_handler is not None:
+            return self.worker_handler.get_kv_connector_stats()
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_kv_connector_stats()
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        return (
+            OffloadingConnectorStats(data=data)
+            if data is not None
+            else OffloadingConnectorStats()
+        )
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return SimpleCPUOffloadPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
 
     # --- Scheduler-side methods ---
 

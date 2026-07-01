@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
@@ -16,14 +18,66 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
     BatchMemcpyParams,
     build_params,
-    copy_blocks,
+    launch_prepared_copy,
+    prepare_copy,
 )
 
 logger = init_logger(__name__)
 
 
+@dataclass
+class DmaCopyEvent:
+    """A completed/in-flight DMA copy with timing events and its byte size.
+
+    ``start_event``/``end_event`` are ``enable_timing`` events bracketing only
+    the DMA launch (host-side prep runs before ``start_event``). ``release``
+    returns the event pair to the copy thread's pool once the worker has read
+    the timing; it is cleared after the first call to avoid double-release.
+    """
+
+    event_idx: int
+    start_event: torch.Event
+    end_event: torch.Event
+    num_bytes: int
+    is_store: bool
+    release: Callable[[], None] | None = None
+
+
+class _EventPairPool:
+    """Recycle ``enable_timing`` event pairs to avoid per-copy allocation.
+
+    ``acquire`` is called on the copy thread; ``release`` on the worker thread.
+    Backed by a thread-safe ``queue.SimpleQueue``.
+    """
+
+    def __init__(self, initial_size: int) -> None:
+        self._pool: queue.SimpleQueue[tuple[torch.Event, torch.Event]] = (
+            queue.SimpleQueue()
+        )
+        for _ in range(initial_size):
+            self._pool.put(self._new_pair())
+
+    @staticmethod
+    def _new_pair() -> tuple[torch.Event, torch.Event]:
+        return (
+            torch.Event(enable_timing=True),
+            torch.Event(enable_timing=True),
+        )
+
+    def acquire(self) -> tuple[torch.Event, torch.Event]:
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            return self._new_pair()
+
+    def release(self, start_event: torch.Event, end_event: torch.Event) -> None:
+        self._pool.put((start_event, end_event))
+
+
 class DmaCopyBackend:
     """cuMemcpyBatchAsync copy backend (background thread)."""
+
+    _EVENT_POOL_INITIAL_SIZE = 16
 
     def __init__(self) -> None:
         self._store_params: BatchMemcpyParams | None = None
@@ -74,7 +128,7 @@ class DmaCopyBackend:
         dst_blocks: list[int],
         is_store: bool,
         event_idx: int,
-        events_list: list[tuple[int, torch.Event]],
+        events_list: list[DmaCopyEvent],
         wait_event: torch.Event | None = None,
     ) -> None:
         params = self._store_params if is_store else self._load_params
@@ -108,6 +162,7 @@ class DmaCopyBackend:
         store_stream: torch.cuda.Stream,
     ) -> None:
         current_platform.set_device(device)
+        event_pool = _EventPairPool(DmaCopyBackend._EVENT_POOL_INITIAL_SIZE)
         while True:
             item = q.get()
             if item is None:
@@ -122,9 +177,29 @@ class DmaCopyBackend:
                 wait_event,
             ) = item
             stream = store_stream if is_store else load_stream
+            # #46278: enqueue the compute-done wait FIRST — before the host-side
+            # prepare — so it captures the shared compute event's current state
+            # and a subsequent step cannot re-record that event during prepare.
             if wait_event is not None:
                 stream.wait_event(wait_event)
-            copy_blocks(src_blocks, dst_blocks, params)
-            event = torch.Event()
-            event.record(stream)
-            events_list.append((event_idx, event))
+            # Host-side address/size prep runs before the timing bracket, so
+            # kv_offload_*_time measures only the DMA (not the numpy prep, and
+            # not the compute-done wait, which is ordered before start_event).
+            prepared = prepare_copy(src_blocks, dst_blocks, params)
+            start_event, end_event = event_pool.acquire()
+            start_event.record(stream)
+            if prepared is not None:
+                launch_prepared_copy(prepared, params)
+            end_event.record(stream)
+            events_list.append(
+                DmaCopyEvent(
+                    event_idx=event_idx,
+                    start_event=start_event,
+                    end_event=end_event,
+                    num_bytes=prepared.num_bytes if prepared is not None else 0,
+                    is_store=is_store,
+                    release=(
+                        lambda s=start_event, e=end_event: event_pool.release(s, e)
+                    ),
+                )
+            )
