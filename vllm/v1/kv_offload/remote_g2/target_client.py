@@ -17,6 +17,8 @@ to the source's Unix domain socket.
 from __future__ import annotations
 
 import base64
+import contextlib
+import os
 import pickle
 import threading
 from collections.abc import Mapping
@@ -32,6 +34,26 @@ from vllm.v1.kv_offload.remote_g2.data_model import (
 )
 
 logger = init_logger(__name__)
+
+# Method-name translation for the dynamo parent target bridge. The bridge
+# (dynamo.*.kv_p2p.target_rpc_local) routes by a short verb and then calls the
+# matching source endpoint via ``client.direct(instance_id=source_worker_id)``.
+# Direct (same-host POC) mode keeps the long source-RPC verbs.
+_BRIDGE_METHOD = {
+    "resolve_and_lease": "resolve",
+    "release_lease": "release",
+    "get_metadata": "metadata",
+}
+
+
+def target_bridge_socket_path(parent_pid: int | None = None) -> str:
+    """Path of the dynamo parent's target-bridge REP socket.
+
+    Mirrors ``source_rpc.default_socket_path``: the dynamo parent binds the
+    bridge keyed by its own pid, so the engine subprocess reaches it via its
+    parent pid (``os.getppid()``)."""
+    pid = parent_pid if parent_pid is not None else os.getppid()
+    return f"/tmp/dynamo_remote_g2_target_{pid}.sock"
 
 
 def _descriptor_from_wire(wire: Mapping[str, Any]) -> RemoteG2Descriptor:
@@ -72,9 +94,29 @@ class TargetG2RpcClient:
         source_socket_path: str,
         *,
         timeout_ms: int = 5000,
+        via_bridge: bool = False,
+        source_worker_id: int | None = None,
     ) -> None:
+        """Connect to the source's RPC.
+
+        Two transports:
+        * Direct (default, same-host POC): ``source_socket_path`` is the
+          source engine's own REP socket and the long source-RPC verbs are
+          sent verbatim.
+        * Via bridge (``via_bridge=True``): ``source_socket_path`` is the
+          dynamo parent's target-bridge REP socket. ``source_worker_id`` is
+          injected into every payload and the verbs are mapped to the
+          bridge's short verbs so the parent can ``client.direct(...)`` to the
+          right source worker — this is the cross-node / >2-worker path.
+        """
         self._socket_path = source_socket_path
         self._timeout_ms = int(timeout_ms)
+        self._via_bridge = bool(via_bridge)
+        self._source_worker_id = (
+            int(source_worker_id) if source_worker_id is not None else None
+        )
+        if self._via_bridge and self._source_worker_id is None:
+            raise ValueError("via_bridge=True requires source_worker_id")
         self._ctx = zmq.Context.instance()
         self._sock: zmq.Socket | None = None
         self._lock = threading.Lock()
@@ -99,25 +141,36 @@ class TargetG2RpcClient:
     def close(self) -> None:
         with self._lock:
             if self._sock is not None:
-                try:
+                with contextlib.suppress(Exception):
                     self._sock.close(linger=0)
-                except Exception:
-                    pass
                 self._sock = None
 
     def _request(self, method: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        wire_payload = dict(payload)
+        if self._via_bridge:
+            # The bridge routes by a short verb and needs to know which source
+            # worker to client.direct() to. ``stats`` has no bridge verb (it is
+            # a same-host debug call only) so it is sent through unmapped and
+            # will fail loudly if ever attempted via the bridge.
+            method = _BRIDGE_METHOD.get(method, method)
+            wire_payload["source_worker_id"] = self._source_worker_id
         with self._lock:
             sock = self._ensure_socket()
-            sock.send(pickle.dumps({"method": method, "payload": dict(payload)}))
             try:
+                sock.send(pickle.dumps({"method": method, "payload": wire_payload}))
                 raw = sock.recv()
-            except zmq.error.Again as exc:
-                # Tear the socket down — REQ goes into a stuck state after
-                # a timed-out recv and needs a fresh socket.
+            except zmq.error.ZMQError as exc:
+                # Any ZMQ error (notably a recv timeout, zmq.error.Again, but
+                # also a failed send) leaves the REQ socket stuck in the wrong
+                # send/recv state (EFSM). Close it so the next call rebuilds.
+                with contextlib.suppress(Exception):
+                    sock.close(linger=0)
                 self._sock = None
-                raise TimeoutError(
-                    f"RemoteG2 {method} timed out after {self._timeout_ms} ms"
-                ) from exc
+                if isinstance(exc, zmq.error.Again):
+                    raise TimeoutError(
+                        f"RemoteG2 {method} timed out after {self._timeout_ms} ms"
+                    ) from exc
+                raise
             return pickle.loads(raw)
 
     def resolve_and_lease(

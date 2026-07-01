@@ -253,7 +253,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         self._resolve_cache[req_context.req_id] = entry
         if result.lease_id is not None and result.descriptors:
             self.registry.plan_resolved_count += 1
-            logger.info(
+            logger.debug(
                 "RemoteG2: req %s plan %s resolved: %d descriptors, "
                 "lease=%s, reason=%s",
                 req_context.req_id,
@@ -263,7 +263,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
                 result.reason,
             )
         else:
-            logger.info(
+            logger.debug(
                 "RemoteG2: req %s plan %s resolve returned no descriptors "
                 "(reason=%s)",
                 req_context.req_id,
@@ -332,7 +332,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
 
         self.registry.plan_load_specs_emitted += 1
         self.registry.plan_blocks_loaded += len(handles)
-        logger.info(
+        logger.debug(
             "RemoteG2: req %s prepare_load -> RemoteG2LoadSpec "
             "(%d blocks, lease=%s, source_worker_id=%d)",
             req_context.req_id,

@@ -45,6 +45,9 @@ CHECK_IMPORTS = {
             "tests/tokenizers_/test_hf.py",
             "tests/utils_/test_hashing.py",
             "tests/compile/test_aot_compile.py",
+            # Remote-G2 dynamic-bridge wire test inspects the pickle envelope
+            # the target client sends (the KV-P2P IPC protocol is pickle).
+            "tests/v1/kv_offload/remote_g2/test_dynamic_bridge.py",
             "benchmarks/kernels/graph_machete_bench.py",
             "benchmarks/kernels/benchmark_lora.py",
             "benchmarks/kernels/benchmark_machete.py",

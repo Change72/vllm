@@ -49,7 +49,10 @@ from vllm.v1.kv_offload.remote_g2.source_rpc import (
     SourceG2RpcServer,
     default_socket_path,
 )
-from vllm.v1.kv_offload.remote_g2.target_client import TargetG2RpcClient
+from vllm.v1.kv_offload.remote_g2.target_client import (
+    TargetG2RpcClient,
+    target_bridge_socket_path,
+)
 from vllm.v1.kv_offload.remote_g2.transfer_handler import (
     RemoteG2OffloadingWorker,
     RemoteG2TransferHandler,
@@ -71,13 +74,21 @@ def _resolve_str(extra: dict, key: str, env: str, default: str) -> str:
     return os.environ.get(env, default)
 
 
+def _truthy(val: object) -> bool:
+    # A real bool passes through; strings use the canonical set so "false"/"0"/
+    # "no"/"off" are False (plain bool("false") would be True).
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _resolve_bool(extra: dict, key: str, env: str, default: bool) -> bool:
     if key in extra:
-        return bool(extra[key])
+        return _truthy(extra[key])
     raw = os.environ.get(env)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return _truthy(raw)
 
 
 class _BundleFromPayload:
@@ -193,7 +204,32 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         self.use_mock_nixl = _resolve_bool(
             extra, "use_mock_nixl", "REMOTE_G2_USE_MOCK_NIXL", False
         )
-        self.enable_source_rpc: bool = bool(extra.get("enable_source_rpc", True))
+        self.enable_source_rpc: bool = _truthy(extra.get("enable_source_rpc", True))
+        # Dynamic transport: when set, the target resolves a plan's source via
+        # the dynamo parent target-bridge (client.direct by the source's real
+        # WorkerId) instead of a static peer_endpoints socket. This is the
+        # cross-node / >2-worker path. Default off keeps the same-host static
+        # peer_endpoints transport that the 2-worker smoke tests rely on.
+        self.use_dynamo_bridge: bool = _resolve_bool(
+            extra, "use_dynamo_bridge", "REMOTE_G2_USE_DYNAMO_BRIDGE", False
+        )
+        # Explicit parent target-bridge socket path, injected by the dynamo
+        # worker (which knows its own PID). Preferred over deriving it from
+        # os.getppid(), which under TP>1 resolves to the EngineCore PID — a
+        # grandchild of the dynamo parent — not the PID the bridge is keyed by.
+        self.target_bridge_socket_path: str = _resolve_str(
+            extra,
+            "target_bridge_socket_path",
+            "REMOTE_G2_TARGET_BRIDGE_SOCKET_PATH",
+            "",
+        )
+        # Bridge RPCs traverse an extra hop (engine -> parent bridge ->
+        # client.direct -> source) whose parent dispatch allows up to 30s and
+        # whose first endpoint discovery may take ~10s, so the same-host 5s
+        # default would fall back prematurely and orphan a source-side lease.
+        self.bridge_timeout_ms: int = _resolve_int(
+            extra, "bridge_timeout_ms", "REMOTE_G2_BRIDGE_TIMEOUT_MS", 45_000
+        )
 
         # peer_worker_id -> source rpc socket path. Populated either
         # from extra_config or via set_peer_endpoint() at runtime.
@@ -220,12 +256,16 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             tuple[int, int], TargetG2RpcClient
         ] = {}
         self._clients_lock = threading.Lock()
+        # Peers whose NIXL metadata handshake (get_metadata + add_peer) already
+        # completed for this rank; skip re-handshaking on every subsequent plan
+        # to keep the control-plane cost off the transfer hot path.
+        self._handshaked_peers: set[str] = set()
         # The remote (NIXL) source/target wiring is brought up lazily on the
         # first get_worker() call, once the CPU pool tensors exist.
         self._remote_initialized = False
         # Handshake-metadata state for TP>1 scheduler-coordinator path.
-        # Worker fills _handshake_payload during get_worker()/_setup_remote() and exposes
-        # it via get_handshake_metadata. Scheduler caches the merged
+        # Worker fills _handshake_payload during get_worker()/_setup_remote()
+        # and exposes it via get_handshake_metadata. Scheduler caches the merged
         # per-rank dict in _per_rank_handshake when EngineCore calls
         # set_xfer_handshake_metadata, then starts/updates the source
         # RPC server so its get_metadata can answer per-rank queries.
@@ -528,6 +568,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                     client.close()
             self._target_clients.clear()
             self._target_clients_by_rank.clear()
+            self._handshaked_peers.clear()
 
     # ----------------------------------------------------------------
     # Handshake metadata hooks called by OffloadingConnector. The base
@@ -631,16 +672,35 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
 
     # --- target side wiring ---
 
-    def _build_target_client(self, plan: RemoteKvReusePlan) -> TargetG2RpcClient | None:
-        sock = self._peer_endpoints.get(int(plan.source_worker_id))
+    def _new_target_client(self, worker_id: int) -> TargetG2RpcClient | None:
+        """Construct a client reaching source ``worker_id``.
+
+        Dynamic mode (``use_dynamo_bridge``): point at the dynamo parent's
+        target-bridge socket and pass ``source_worker_id`` so the parent routes
+        via ``client.direct(...)`` to any worker. Static mode: look up the
+        peer's own REP socket in ``peer_endpoints`` (same-host transport)."""
+        if self.use_dynamo_bridge:
+            # Prefer the dynamo-injected explicit path; fall back to the
+            # getppid()-derived path only when it was not supplied (TP=1).
+            bridge_sock = self.target_bridge_socket_path or target_bridge_socket_path()
+            return TargetG2RpcClient(
+                bridge_sock,
+                timeout_ms=self.bridge_timeout_ms,
+                via_bridge=True,
+                source_worker_id=int(worker_id),
+            )
+        sock = self._peer_endpoints.get(int(worker_id))
         if not sock:
             logger.warning(
                 "RemoteG2: no peer endpoint registered for worker_id=%d; "
-                "configure kv_connector_extra_config.peer_endpoints or "
-                "call set_peer_endpoint() at boot",
-                plan.source_worker_id,
+                "configure kv_connector_extra_config.peer_endpoints, call "
+                "set_peer_endpoint() at boot, or enable use_dynamo_bridge",
+                worker_id,
             )
             return None
+        return TargetG2RpcClient(sock)
+
+    def _build_target_client(self, plan: RemoteKvReusePlan) -> TargetG2RpcClient | None:
         # Cache keyed by (source_worker_id, my_tp_rank). For TP>1 the
         # source-side RPC is in scheduler so all our target ranks talk
         # to the same socket, but each rank uses its own client so
@@ -649,7 +709,9 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         with self._clients_lock:
             client = self._target_clients_by_rank.get(cache_key)
             if client is None:
-                client = TargetG2RpcClient(sock)
+                client = self._new_target_client(int(plan.source_worker_id))
+                if client is None:
+                    return None
                 self._target_clients_by_rank[cache_key] = client
         return client
 
@@ -660,6 +722,10 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         """
         if self._target_adapter is None:
             return False
+        # Already handshaked with this peer on this rank -> nothing to do.
+        with self._clients_lock:
+            if peer_name in self._handshaked_peers:
+                return True
         # peer_name format from manager.prepare_load:
         # f"{plan.source_tier}:{plan.source_worker_id}"
         try:
@@ -676,10 +742,9 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         with self._clients_lock:
             client = self._target_clients_by_rank.get(cache_key)
         if client is None:
-            sock = self._peer_endpoints.get(worker_id)
-            if sock is None:
+            client = self._new_target_client(worker_id)
+            if client is None:
                 return False
-            client = TargetG2RpcClient(sock)
             with self._clients_lock:
                 self._target_clients_by_rank.setdefault(cache_key, client)
                 client = self._target_clients_by_rank[cache_key]
@@ -708,6 +773,8 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 peer_layer_pool_base_ptrs=[int(p) for p in layer_bases],
                 peer_layer_pool_size_bytes=[int(s) for s in layer_sizes],
             )
+            with self._clients_lock:
+                self._handshaked_peers.add(peer_name)
             return True
         except Exception:
             logger.exception("RemoteG2: add_peer failed for %s", peer_name)
