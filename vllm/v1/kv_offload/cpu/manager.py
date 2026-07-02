@@ -106,6 +106,35 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> CPULoadStoreSpec:
         return CPULoadStoreSpec([block.block_id for block in blocks])
 
+    def _acquire_block_ref(self, key: OffloadKey) -> BlockStatus:
+        """Acquire one reader reference and update policy bookkeeping.
+
+        Other components that protect a CPU-cache block from eviction (for
+        example a Remote-G2 source lease) must use this transition instead of
+        mutating ``BlockStatus.ref_cnt`` directly.  LRU keeps a dedicated
+        evictable index, so the count and policy transition are one atomic
+        invariant owned by the manager.
+        """
+        block = self._policy.get(key)
+        assert block is not None, f"Block {key!r} not found in cache"
+        assert block.is_ready, f"Block {key!r} is not ready for reading"
+        if block.ref_cnt == 0:
+            self._policy.mark_non_evictable(key)
+            self._num_evictable_cache_blocks -= 1
+            assert self._num_evictable_cache_blocks >= 0
+        block.ref_cnt += 1
+        return block
+
+    def _release_block_ref(self, key: OffloadKey) -> None:
+        """Release one reader reference and update policy bookkeeping."""
+        block = self._policy.get(key)
+        assert block is not None, f"Block {key!r} not found"
+        assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
+        block.ref_cnt -= 1
+        if block.ref_cnt == 0:
+            self._num_evictable_cache_blocks += 1
+            self._policy.mark_evictable(key)
+
     # --- OffloadingManager interface ---
 
     @override
@@ -135,17 +164,7 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> LoadStoreSpec:
-        blocks = []
-        for key in keys:
-            block = self._policy.get(key)
-            assert block is not None, f"Block {key!r} not found in cache"
-            assert block.is_ready, f"Block {key!r} is not ready for reading"
-            if block.ref_cnt == 0:
-                self._policy.mark_non_evictable(key)
-                self._num_evictable_cache_blocks -= 1  # ref_cnt 0 -> 1
-                assert self._num_evictable_cache_blocks >= 0
-            block.ref_cnt += 1
-            blocks.append(block)
+        blocks = [self._acquire_block_ref(key) for key in keys]
         return self._get_load_store_spec(keys, blocks)
 
     @override
@@ -157,13 +176,7 @@ class CPUOffloadingManager(OffloadingManager):
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
         for key in keys:
-            block = self._policy.get(key)
-            assert block is not None, f"Block {key!r} not found"
-            assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
-            block.ref_cnt -= 1
-            if block.ref_cnt == 0:
-                self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
-                self._policy.mark_evictable(key)
+            self._release_block_ref(key)
 
     @override
     def prepare_store(

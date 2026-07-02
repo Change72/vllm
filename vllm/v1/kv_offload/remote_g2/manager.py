@@ -55,6 +55,7 @@ from vllm.v1.kv_offload.remote_g2.load_spec import (
 logger = init_logger(__name__)
 
 REMOTE_G2_PLAN_KEY = "remote_g2_plan"
+_LoadSource = Literal["local", "remote"]
 
 
 def block_hash_to_router_int(block_hash_bytes: bytes) -> int:
@@ -131,7 +132,11 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         # run on the SCHEDULER side). Last-wins guarantees the
         # scheduler's populated policy is what the source RPC sees
         # when it pins blocks for an inbound lease.
-        self.registry.set_policy(self._policy)
+        self.registry.set_policy(
+            self._policy,
+            acquire_block_ref=self._acquire_block_ref,
+            release_block_ref=self._release_block_ref,
+        )
         # Override the medium label on BlockStored / BlockRemoved events so the
         # Dynamo Router classifies our blocks as host-pinned. The inherited
         # CPUOffloadingManager publishes ``self.medium = "CPU"`` (from
@@ -150,6 +155,20 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
 
         # Per-request resolve cache: req_id -> ResolveResult.
         self._resolve_cache: dict[str, _ResolveCacheEntry] = {}
+        # Successful worker READs release their lease before scheduler
+        # completion.  Keep consumed entries only for an idempotent retry at
+        # request finish/reset; they are never eligible for another load.
+        self._consumed_resolve_entries: dict[str, list[_ResolveCacheEntry]] = {}
+        # The scheduler accepts exactly one source LoadStoreSpec per load job.
+        # Lock each request to the first source that produced a lookup hit so
+        # a local/remote boundary terminates the prefix instead of producing a
+        # mixed batch that neither backend can load.
+        self._load_source_by_req: dict[str, _LoadSource] = {}
+        # Authoritative source of a successfully prepared, in-flight load.
+        # request_finished may run before complete_load on cancellation, so
+        # this marker (and a remote resolve entry) must outlive lookup state.
+        self._prepared_load_source_by_req: dict[str, _LoadSource] = {}
+        self._finished_with_pending_load: set[str] = set()
         # Target-side RPC client for plan resolves; populated by the
         # spec once a plan is observed.
         self._target_client_factory: TargetClientFactory | None = None
@@ -268,11 +287,42 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         return entry
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        req_id = req_context.req_id
+        selected = self._load_source_by_req.get(req_id)
+        if selected == "local":
+            with self._rlock:
+                return super().lookup(key, req_context)
+        if selected == "remote":
+            entry = self._resolve_cache.get(req_id)
+            if entry is None:
+                plan = self._peek_plan(req_context)
+                if plan is None:
+                    return LookupResult.MISS
+                # A completed remote load consumes its lease.  A request that
+                # is resumed/preempted and loads again must resolve fresh
+                # descriptors rather than reuse offsets whose pins were
+                # already released by the worker's on_load_done callback.
+                entry = self._ensure_resolve(req_context, plan)
+            if entry is None or entry.result.lease_id is None:
+                return LookupResult.MISS
+            block_hash_int = block_hash_to_router_int(get_offload_block_hash(key))
+            return (
+                LookupResult.HIT
+                if block_hash_int in entry.descriptor_by_hash
+                else LookupResult.MISS
+            )
+
         with self._rlock:
             base = super().lookup(key, req_context)
-        # Any local result (HIT / HIT_PENDING / RETRY) wins over the remote
-        # plan; only fall back to the plan on a genuine local MISS.
+        # The first positive source wins for the whole request.  A later key
+        # that only exists in the other source terminates the maximal prefix.
         if base != LookupResult.MISS:
+            # A reverse/sliding lookup may already have resolved a plan for a
+            # different key.  Once local wins, that remote lease is unused;
+            # release it immediately instead of pinning source capacity until
+            # the request eventually finishes.
+            self._release_resolve_entry(req_id, reason="local_selected")
+            self._load_source_by_req[req_id] = "local"
             return base
 
         plan = self._peek_plan(req_context)
@@ -283,6 +333,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             return base
         block_hash_int = block_hash_to_router_int(get_offload_block_hash(key))
         if block_hash_int in entry.descriptor_by_hash:
+            self._load_source_by_req[req_id] = "remote"
             return LookupResult.HIT
         return LookupResult.MISS
 
@@ -291,26 +342,32 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> LoadStoreSpec:
-        # Two cases:
-        # 1. All keys are local (legacy CPU path) — defer to super().
-        # 2. Any key is plan-resolved — emit a RemoteG2LoadSpec for the
-        #    whole batch (POC: we don't split mixed batches; lookup
-        #    ordering means a plan covers a contiguous prefix that the
-        #    scheduler asks to load as one unit).
-        plan = self._peek_plan(req_context)
-        entry = self._ensure_resolve(req_context, plan) if plan else None
-        if entry is None or entry.result.lease_id is None:
+        req_id = req_context.req_id
+        if req_id in self._prepared_load_source_by_req:
+            raise RuntimeError(f"RemoteG2: req {req_id} already has a prepared load")
+
+        selected = self._load_source_by_req.get(req_id, "local")
+        if selected == "local":
             with self._rlock:
-                return super().prepare_load(keys, req_context)
+                spec = super().prepare_load(keys, req_context)
+            self._prepared_load_source_by_req[req_id] = "local"
+            return spec
+
+        entry = self._resolve_cache.get(req_id)
+        if entry is None or entry.result.lease_id is None:
+            raise RuntimeError(
+                f"RemoteG2: req {req_id} selected remote load without a live lease"
+            )
 
         handles: list[_RemoteBlockHandle] = []
-        all_remote = True
         for key in keys:
             block_hash_int = block_hash_to_router_int(get_offload_block_hash(key))
             desc = entry.descriptor_by_hash.get(block_hash_int)
             if desc is None:
-                all_remote = False
-                break
+                raise RuntimeError(
+                    f"RemoteG2: key {key!r} is not covered by the selected "
+                    f"remote plan for req {req_id}"
+                )
             handles.append(
                 _RemoteBlockHandle(
                     block_hash=desc.block_hash,
@@ -319,9 +376,8 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
                     byte_length=desc.byte_length,
                 )
             )
-        if not all_remote or not handles:
-            with self._rlock:
-                return super().prepare_load(keys, req_context)
+        if not handles:
+            raise RuntimeError(f"RemoteG2: req {req_id} prepared an empty remote load")
 
         self.registry.plan_load_specs_emitted += 1
         self.registry.plan_blocks_loaded += len(handles)
@@ -330,6 +386,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         # data_model.py). Summed from descriptor byte_length == the exact
         # amount the transfer handler moves per block.
         entry.bytes_emitted += sum(int(h.byte_length) for h in handles)
+        self._prepared_load_source_by_req[req_id] = "remote"
         logger.debug(
             "RemoteG2: req %s prepare_load -> RemoteG2LoadSpec "
             "(%d blocks, lease=%s, source_worker_id=%d)",
@@ -351,31 +408,31 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
-        plan = self._peek_plan(req_context)
-        if plan is None:
+        req_id = req_context.req_id
+        selected = self._prepared_load_source_by_req.pop(req_id, None)
+        if selected is None:
+            raise RuntimeError(f"RemoteG2: req {req_id} completed an unprepared load")
+        if selected == "local":
             with self._rlock:
                 super().complete_load(keys, req_context)
-            return
-        # Plan-driven load doesn't go through the CPU pool ref_cnt, so
-        # skip the super() decrement. Lease release happens via the
-        # transfer handler's on_load_done callback.
-        entry = self._resolve_cache.get(req_context.req_id)
-        if entry is None or entry.result.lease_id is None:
-            with self._rlock:
-                super().complete_load(keys, req_context)
-            return
-        # Reaching here means the request was plan-driven AND leased. Only
-        # count it as a completed transfer if ``prepare_load`` actually
-        # emitted a RemoteG2LoadSpec for it (bytes_emitted > 0); a leased
-        # request whose keys turned out to be fully local never emitted a
-        # READ. Because a failed READ crashes the engine step before this
-        # point (assert transfer_result.success), a positive bytes_emitted
-        # here is proof the emitted transfer completed. Zero it after a
-        # counted completion so a re-fired complete_load can't double-count.
-        if self.registry.record_completed_load(
-            entry.bytes_emitted, entry.plan.source_worker_id
-        ):
-            entry.bytes_emitted = 0
+        else:
+            # Plan-driven load doesn't go through the CPU pool ref_cnt.  The
+            # worker releases its source lease after the synchronous READ.
+            # Consume the descriptor entry without another RPC on this hot
+            # path; request finish/reset retains an idempotent cleanup retry.
+            entry = self._resolve_cache.get(req_id)
+            if entry is None or entry.result.lease_id is None:
+                raise RuntimeError(
+                    f"RemoteG2: req {req_id} lost its remote resolve entry"
+                )
+            if self.registry.record_completed_load(
+                entry.bytes_emitted, entry.plan.source_worker_id
+            ):
+                entry.bytes_emitted = 0
+            self._consume_resolve_entry(req_id)
+
+        if req_id in self._finished_with_pending_load:
+            self._finalize_request(req_id, reason="req_done_after_load")
 
     def prepare_store(
         self,
@@ -420,14 +477,43 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         return super().on_new_request(req_context)
 
     def on_request_finished(self, req_context: ReqContext) -> None:
-        entry = self._resolve_cache.pop(req_context.req_id, None)
-        if entry is not None and entry.result.lease_id is not None:
+        req_id = req_context.req_id
+        self._load_source_by_req.pop(req_id, None)
+        if req_id in self._prepared_load_source_by_req:
+            # The scheduler contract permits request_finished before a
+            # pending load completion (e.g. cancellation).  Releasing a
+            # remote lease here could expose its source blocks to eviction
+            # while the READ is still in flight; retain all completion state.
+            self._finished_with_pending_load.add(req_id)
+            return
+        self._finalize_request(req_id, reason="req_done")
+
+    def _finalize_request(self, req_id: str, *, reason: str) -> None:
+        self._load_source_by_req.pop(req_id, None)
+        self._finished_with_pending_load.discard(req_id)
+        self._release_resolve_entry(req_id, reason=reason)
+        for entry in self._consumed_resolve_entries.pop(req_id, []):
+            self._release_entry(entry, reason=reason)
+
+    def _consume_resolve_entry(self, req_id: str) -> None:
+        entry = self._resolve_cache.pop(req_id, None)
+        if entry is not None:
+            self._consumed_resolve_entries.setdefault(req_id, []).append(entry)
+
+    def _release_resolve_entry(self, req_id: str, *, reason: str) -> None:
+        entry = self._resolve_cache.pop(req_id, None)
+        if entry is not None:
+            self._release_entry(entry, reason=reason)
+
+    @staticmethod
+    def _release_entry(entry: _ResolveCacheEntry, *, reason: str) -> None:
+        if entry.result.lease_id is not None:
             try:
-                entry.client.release_lease(entry.result.lease_id, reason="req_done")
+                entry.client.release_lease(entry.result.lease_id, reason=reason)
             except Exception:
                 logger.warning(
-                    "RemoteG2: release_lease on req finish failed; "
-                    "source TTL will collect lease %s",
+                    "RemoteG2: release_lease cleanup failed; "
+                    "source-side cleanup is still required for lease %s",
                     entry.result.lease_id,
                 )
 
@@ -436,19 +522,54 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             events = list(super().take_events())
         yield from events
 
+    def on_schedule_end(self) -> None:
+        # A full-attention lookup stops on its first MISS; a sliding-window
+        # lookup may inspect more keys but still select no source.  Either way,
+        # a resolved-but-unselected entry must not pin remote capacity for the
+        # lifetime of a request that will recompute.
+        unused = [
+            req_id
+            for req_id in self._resolve_cache
+            if req_id not in self._load_source_by_req
+            and req_id not in self._prepared_load_source_by_req
+        ]
+        for req_id in unused:
+            self._release_resolve_entry(req_id, reason="unused_resolve")
+
     def reset_cache(self) -> None:
         with self._rlock:
+            # The connector queues local worker flushes before calling reset,
+            # but it has no cross-worker completion/flush acknowledgement.
+            # Releasing either side here could let a source buffer be reused
+            # while a NIXL READ is still in flight.  Refuse the reset without
+            # mutating state; callers may retry after loads and leases drain.
+            if self._prepared_load_source_by_req:
+                raise RuntimeError(
+                    "RemoteG2: cannot reset cache with pending load jobs"
+                )
+            if self.registry._leases:
+                raise RuntimeError(
+                    "RemoteG2: cannot reset cache with active inbound leases"
+                )
+
             super().reset_cache()
-            # Drop every descriptor, hash↔key entry, and active lease.
-            # reset_cache is only called when the policy is being
-            # fully wiped (e.g. on shutdown / engine restart), so any
-            # outstanding lease is meaningless and any peer holding
-            # one would error out on its next read regardless.
+            # No leases are active, so descriptors and hash mappings can be
+            # invalidated atomically with the local policy reset.
             for block_hash in list(self.registry._records.keys()):
                 self.registry.remove_descriptor(block_hash)
                 self.registry.forget_key(block_hash)
-            for lease_id in list(self.registry._leases.keys()):
-                self.registry.release_lease(lease_id, reason="reset_cache")
+
+        # Resolved-but-never-submitted and already-consumed outbound entries
+        # are safe to release after the local pool is empty: neither has an
+        # in-flight READ.  This is outside the registry lock because it can do
+        # a synchronous RPC to another worker.
+        pending_req_ids = set(self._resolve_cache) | set(self._consumed_resolve_entries)
+        for req_id in pending_req_ids:
+            self._finalize_request(req_id, reason="reset_cache")
+        self._load_source_by_req.clear()
+        self._prepared_load_source_by_req.clear()
+        self._finished_with_pending_load.clear()
+        self._consumed_resolve_entries.clear()
 
     # --- registry population (must be called with _rlock held) ---
 

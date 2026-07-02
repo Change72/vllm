@@ -346,15 +346,15 @@ class SourceG2DescriptorRegistry:
         self.transport_backend: str = "unset"
         self.transport_mock: bool = True
 
-        # Source-side eviction protection. The CPUOffloadingManager's
-        # policy enforces eviction by ref_cnt and a per-call ``protected``
-        # set; a lease that has resolved a descriptor for hash X must
-        # bump policy.get(key_for_X).ref_cnt so a parallel store on the
-        # scheduler thread doesn't evict X out from under the in-flight
-        # NIXL READ. ``set_policy`` is first-wins: the SCHEDULER-side
-        # manager (where stores actually run) registers first; the
-        # worker-side manager's call is a no-op.
+        # Source-side eviction protection. A lease must use the owning
+        # CPUOffloadingManager's complete ref-count transition, not mutate
+        # ref_cnt directly: LRU also maintains a dedicated evictable index
+        # and the manager owns its evictable-block counter. ``set_policy``
+        # installs the policy and those callbacks together (last-wins so the
+        # scheduler-side manager replaces the empty worker-side manager).
         self._policy: Any = None
+        self._acquire_block_ref: Callable[[Any], Any] | None = None
+        self._release_block_ref: Callable[[Any], None] | None = None
         self._hash_to_key: dict[int, Any] = {}
         # Lease pin counters and stats — independent from
         # SourceG2DescriptorRecord.lease_count (which is a per-record
@@ -543,7 +543,13 @@ class SourceG2DescriptorRegistry:
 
     # --- policy plumbing (scheduler-manager side) ---
 
-    def set_policy(self, policy: Any) -> bool:
+    def set_policy(
+        self,
+        policy: Any,
+        *,
+        acquire_block_ref: Callable[[Any], Any] | None = None,
+        release_block_ref: Callable[[Any], None] | None = None,
+    ) -> bool:
         """Register the CPUOffloadingManager's policy with the registry.
 
         Last-wins. In vLLM v1's EngineCore startup, the WORKER-role
@@ -559,6 +565,8 @@ class SourceG2DescriptorRegistry:
         with self._lock:
             previous = self._policy
             self._policy = policy
+            self._acquire_block_ref = acquire_block_ref
+            self._release_block_ref = release_block_ref
         logger.info(
             "RemoteG2 registry.set_policy: installed %r (replaced=%s)",
             type(policy).__name__,
@@ -626,8 +634,8 @@ class SourceG2DescriptorRegistry:
                 "RemoteG2: pin_failed for hash=%d cause=policy_missing_block "
                 "(key_len=%d, key_prefix=%r, policy_size=%d, sample_key=%r)",
                 int(block_hash_int),
-                len(key) if isinstance(key, (bytes, bytearray)) else -1,
-                key[:16] if isinstance(key, (bytes, bytearray)) else key,
+                len(key) if isinstance(key, bytes | bytearray) else -1,
+                key[:16] if isinstance(key, bytes | bytearray) else key,
                 policy_size,
                 policy_sample[0] if policy_sample else None,
             )
@@ -642,7 +650,17 @@ class SourceG2DescriptorRegistry:
                 block.block_id,
             )
             return False
-        block.ref_cnt += 1
+        if self._acquire_block_ref is not None:
+            # The manager callback performs ref_cnt plus the policy's
+            # 0 -> 1 transition and evictable-counter update atomically under
+            # this same RLock.  The checks above keep the registry's detailed
+            # pin-failure diagnostics and make callback assertions invariant
+            # failures rather than ordinary races.
+            self._acquire_block_ref(key)
+        else:
+            # Standalone registry tests/consumers may install only a policy.
+            # Keep the legacy direct-ref fallback for those users.
+            block.ref_cnt += 1
         self.pin_count_total += 1
         return True
 
@@ -657,7 +675,11 @@ class SourceG2DescriptorRegistry:
         if key is None:
             return
         block = self._policy.get(key)
-        if block is not None and block.ref_cnt > 0:
+        if block is None or block.ref_cnt <= 0:
+            return
+        if self._release_block_ref is not None:
+            self._release_block_ref(key)
+        else:
             block.ref_cnt -= 1
 
     def upsert_descriptor(self, record: SourceG2DescriptorRecord) -> None:
