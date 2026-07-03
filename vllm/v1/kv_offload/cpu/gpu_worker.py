@@ -469,8 +469,14 @@ class CPUOffloadingWorker(OffloadingWorker):
         block_size_factor: int,
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
+        *,
+        enable_background_pinning: bool = True,
     ):
-        pin_memory = PIN_MEMORY
+        # Some transports (notably NIXL/UCX) register these exact host
+        # regions themselves.  Running cudaHostRegister concurrently with
+        # that registration is both redundant and invalid on CUDA drivers
+        # that reject a second registration with cudaErrorHostMemoryAlreadyRegistered.
+        pin_memory = PIN_MEMORY and enable_background_pinning
         self.pin_thread: threading.Thread | None = None
         self._manually_pinned_tensors: list[torch.Tensor] = []
 

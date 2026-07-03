@@ -345,6 +345,13 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
+            # Real NIXL registers (and therefore pins) every host layer pool
+            # in _setup_remote.  Let it be the sole registration owner;
+            # CPUOffloadingWorker's background cudaHostRegister otherwise
+            # races the UCX cuda_copy memory-domain registration and fails
+            # with "already mapped" on A100.  The mock path has no NIXL
+            # registration, so retain normal CPU-offload pinning there.
+            enable_background_pinning=self.use_mock_nixl,
         )
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
@@ -362,7 +369,9 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         load handler to ``worker``.
 
         Runs once, after ``CPUOffloadingWorker.__init__`` has materialised
-        the inherited pinned-CPU pool tensors (``worker.cpu_tensors``).
+        the inherited CPU pool tensors (``worker.cpu_tensors``).  With real
+        NIXL those tensors are intentionally not pre-pinned: NIXL/UCX owns
+        their one and only host registration below.
         """
         manager = self.get_manager()
         assert isinstance(manager, RemoteG2OffloadingManager)
