@@ -117,9 +117,10 @@ Two constraints we hold ourselves to:
    request's own per-block hashes. Only the intersection becomes a
    `RemoteG2LoadSpec`; misses fall through to local compute.
 6. vLLM scheduler emits a load transfer for `(RemoteG2LoadSpec, GPU)`.
-   Worker-side transfer handler calls `RawNixlRemoteG2Adapter.read_block`
-   per block per layer → batched NIXL `initialize_xfer(READ)` →
-   `wait()`.
+   Worker-side transfer handler calls `RawNixlRemoteG2Adapter.read_blocks`.
+   It preserves source/destination block pairing, flattens every block's
+   layers into aligned descriptor lists, and issues bounded multi-block
+   NIXL `initialize_xfer(READ)` transactions (64 blocks by default).
 7. On request finish or lease TTL, target sends `release_lease(id)`;
    source decrements `_policy[key].ref_cnt`, eviction is unblocked.
 
@@ -199,9 +200,10 @@ on the target and the model produced garbage. The current path:
 - `upsert_for_block` stores only the block_id + the layer-0 byte
   offset in the descriptor; the transfer handler reconstructs each
   layer's pointer at READ time from the bundle metadata.
-- `RawNixlRemoteG2Adapter.read_block` issues one NIXL READ per layer
-  per block (batched into a single `initialize_xfer` per layer for
-  contiguous block runs).
+- `RawNixlRemoteG2Adapter.read_blocks` uses block-major, layer-minor
+  descriptor lists. One `initialize_xfer` covers up to the configured
+  number of logical blocks across all layers; `read_block` is retained as
+  a one-block compatibility wrapper.
 
 ### 4.4 Block-hash projection
 

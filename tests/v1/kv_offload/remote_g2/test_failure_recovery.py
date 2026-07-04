@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Failure-recovery tests for the RemoteG2 transfer handler.
 
-The adapter exposes a ``fault_inject_every`` knob: every Nth
-``read_block`` call raises ``RuntimeError`` instead of moving data.
+The adapter exposes a ``fault_inject_every`` knob: every Nth logical
+block raises ``RuntimeError`` instead of moving data, independent of
+how blocks are grouped into NIXL transactions.
 The transfer handler must propagate this as a failed
 ``TransferResult`` so vLLM's scheduler can apply the configured
 ``kv_load_failure_policy`` (``fail`` or ``recompute``).
@@ -22,6 +23,7 @@ real vLLM engine:
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Sequence
 
 import pytest
 
@@ -112,8 +114,30 @@ def _spec_for(
     return src, dst
 
 
-def test_happy_path_reports_success() -> None:
-    handler, _adapter, src_pools, tgt_pools = _make_handler()
+def test_happy_path_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler, adapter, src_pools, tgt_pools = _make_handler()
+    calls: list[tuple[str, list[int], list[int], list[int]]] = []
+    original_read_blocks = adapter.read_blocks
+
+    def read_blocks_spy(
+        peer_name: str,
+        peer_byte_offsets: Sequence[int],
+        local_byte_offsets: Sequence[int],
+        byte_lengths: Sequence[int],
+    ) -> None:
+        calls.append(
+            (
+                peer_name,
+                list(peer_byte_offsets),
+                list(local_byte_offsets),
+                list(byte_lengths),
+            )
+        )
+        original_read_blocks(
+            peer_name, peer_byte_offsets, local_byte_offsets, byte_lengths
+        )
+
+    monkeypatch.setattr(adapter, "read_blocks", read_blocks_spy)
     src, dst = _spec_for([0, 1, 2, 3])
     assert handler.submit_load(101, src, dst) is True
     finished = handler.get_finished()
@@ -122,6 +146,14 @@ def test_happy_path_reports_success() -> None:
     assert r.job_id == 101
     assert r.success is True
     assert r.transfer_size == NUM_BLOCKS * PAGE_SIZE
+    assert calls == [
+        (
+            "src",
+            [block * PAGE_SIZE for block in range(NUM_BLOCKS)],
+            [block * PAGE_SIZE for block in range(NUM_BLOCKS)],
+            [PAGE_SIZE] * NUM_BLOCKS,
+        )
+    ]
     # And the bytes actually landed (each layer).
     for layer in range(NUM_LAYERS):
         assert bytes(tgt_pools[layer]) == bytes(src_pools[layer])
@@ -137,6 +169,7 @@ def test_every_read_fails_returns_failure() -> None:
     assert len(finished) == 1
     assert finished[0].job_id == 202
     assert finished[0].success is False
+    assert finished[0].transfer_size == 0
 
 
 def test_one_failure_then_recovery() -> None:
@@ -163,11 +196,12 @@ def test_one_failure_then_recovery() -> None:
     handler.submit_load(303, src3, dst3)
     # Need to issue enough additional successful reads so the counter
     # walks past the next multiple of 3 — adapter's counter is shared
-    # across all read_block calls.
+    # across all logical block reads.
     src4, dst4 = _spec_for([1])
     handler.submit_load(304, src4, dst4)
     later = sorted(handler.get_finished(), key=lambda r: r.job_id)
-    assert all(r.job_id in {303, 304} for r in later)
+    assert [r.job_id for r in later] == [303, 304]
+    assert all(r.success for r in later)
 
 
 def test_get_finished_is_idempotent_drain() -> None:

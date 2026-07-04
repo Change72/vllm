@@ -5,8 +5,7 @@
 Driven by ``RemoteG2OffloadingWorker.submit_load`` for the
 ``RemoteG2LoadSpec -> GPULoadStoreSpec`` direction. Decodes the spec,
 ensures the source peer is known to the local NIXL adapter, then issues
-one READ per block from the source's pool offset into the target's GPU
-pool offset.
+bounded multi-block READs from the source's pool into the target's GPU pool.
 
 For the same-host POC where NIXL is unavailable, the underlying
 ``RawNixlRemoteG2Adapter`` falls back to a plain memcpy. The handler
@@ -104,15 +103,19 @@ class RemoteG2TransferHandler:
         total_bytes = 0
         ok = True
         try:
-            for handle, gpu_block_id in zip(src_spec.blocks, gpu_block_ids):
-                local_offset = int(gpu_block_id) * self._gpu_page_size
-                self._adapter.read_block(
-                    src_spec.peer_name,
-                    peer_byte_offset=handle.byte_offset,
-                    local_byte_offset=local_offset,
-                    byte_length=handle.byte_length,
-                )
-                total_bytes += handle.byte_length
+            self._adapter.read_blocks(
+                src_spec.peer_name,
+                peer_byte_offsets=[handle.byte_offset for handle in src_spec.blocks],
+                local_byte_offsets=[
+                    int(gpu_block_id) * self._gpu_page_size
+                    for gpu_block_id in gpu_block_ids
+                ],
+                byte_lengths=[handle.byte_length for handle in src_spec.blocks],
+            )
+            # Logical single-layer bytes. The perf gate multiplies this by the
+            # model's layer count when reporting layer-wise wire-equivalent
+            # bytes. Only claim bytes after the entire batched load succeeds.
+            total_bytes = sum(handle.byte_length for handle in src_spec.blocks)
         except Exception:
             logger.exception("RemoteG2 NIXL READ failed (job_id=%d)", job_id)
             ok = False

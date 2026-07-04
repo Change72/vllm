@@ -137,6 +137,8 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
       ``set_peer_endpoint``.
     * ``use_mock_nixl`` (env ``REMOTE_G2_USE_MOCK_NIXL``) — force the
       bytes-memcpy transport even when ``nixl`` is installed (for tests).
+    * ``max_blocks_per_xfer`` (env ``REMOTE_G2_MAX_BLOCKS_PER_XFER``) —
+      maximum logical blocks in one NIXL transaction; default 64.
     * ``lease_ttl_ms`` — default 30_000.
     """
 
@@ -205,6 +207,14 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         self.use_mock_nixl = _resolve_bool(
             extra, "use_mock_nixl", "REMOTE_G2_USE_MOCK_NIXL", False
         )
+        self.max_blocks_per_xfer = _resolve_int(
+            extra,
+            "max_blocks_per_xfer",
+            "REMOTE_G2_MAX_BLOCKS_PER_XFER",
+            64,
+        )
+        if self.max_blocks_per_xfer <= 0:
+            raise ValueError("max_blocks_per_xfer must be positive")
         self.enable_source_rpc: bool = _truthy(extra.get("enable_source_rpc", True))
         # Dynamic transport: when set, the target resolves a plan's source via
         # the dynamo parent target-bridge (client.direct by the source's real
@@ -536,6 +546,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 gpu_layer_sizes,
                 backends=("UCX",),
                 use_mock=self.use_mock_nixl,
+                max_blocks_per_xfer=self.max_blocks_per_xfer,
             )
         except Exception:
             logger.exception(

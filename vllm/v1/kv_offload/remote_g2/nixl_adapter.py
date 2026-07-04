@@ -9,9 +9,8 @@ Mirrors the TRT-LLM ``remote_g2_raw_nixl_adapter.py`` shape:
   metadata bytes + pool base/size) that ``SourceG2RpcServer.get_metadata``
   hands to peers.
 * Target side: ``RawNixlRemoteG2Adapter`` — construct an agent, register
-  the local GPU pool, on first contact with each peer call
-  ``add_remote_agent`` and ``prep_xfer_dlist`` for the source's pool,
-  then ``make_prepped_xfer`` for each READ.
+  the local GPU pool, add each remote agent, then build aligned descriptor
+  lists and issue bounded multi-block ``initialize_xfer`` READs.
 
 When the ``nixl`` python module is not installed, ``NIXL_AVAILABLE`` is
 ``False`` and the adapter exposes a *mock* transport that copies bytes
@@ -24,6 +23,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -156,17 +156,17 @@ def build_source_agent(
 
 
 class RawNixlRemoteG2Adapter:
-    """Target-side adapter performing per-layer NIXL READs.
+    """Target-side adapter performing batched per-layer NIXL READs.
 
     vLLM v1 allocates one CPU tensor per transformer layer (e.g. 36 for
     Qwen3-8B) and similarly one GPU tensor per layer for the target's
     KV cache. The adapter takes the *list* of per-layer base pointers
     on each side, registers all of them with NIXL in a single
-    ``register_memory`` call, and on each ``read_block`` issues one
-    batched NIXL transfer whose source/destination descriptor list has
-    ``num_layers`` entries — one per layer at the requested block
-    offset. A single ``initialize_xfer`` + ``transfer`` + completion
-    poll covers the whole block, including all its layers.
+    ``register_memory`` call. ``read_blocks`` groups logical blocks into
+    bounded chunks; each NIXL transfer contains ``chunk_blocks *
+    num_layers`` source/destination descriptors. This amortises the
+    transaction setup and completion polling cost while bounding descriptor
+    list size. ``read_block`` remains as a compatibility wrapper.
 
     The mock transport mirrors this by memcpy-ing every layer.
     """
@@ -183,6 +183,7 @@ class RawNixlRemoteG2Adapter:
         local_device_id: int = 0,
         poll_interval_s: float = 0.0005,
         fault_inject_every: int = 0,
+        max_blocks_per_xfer: int = 64,
     ) -> None:
         if not local_layer_pool_base_ptrs:
             raise ValueError("local_layer_pool_base_ptrs must be non-empty")
@@ -196,12 +197,15 @@ class RawNixlRemoteG2Adapter:
         self._poll_interval_s = float(poll_interval_s)
         self._backends = tuple(backends)
         self._use_mock = use_mock or not NIXL_AVAILABLE or not backends
+        self._max_blocks_per_xfer = int(max_blocks_per_xfer)
+        if self._max_blocks_per_xfer <= 0:
+            raise ValueError("max_blocks_per_xfer must be positive")
         self._peers: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
-        # Fault injection: when >0, every Nth read_block call raises
-        # RuntimeError. Used by the failure-recovery test suite to
-        # confirm transfer_handler propagates failures to vLLM's
-        # kv_load_failure_policy. Defaults to 0 (off).
+        # Fault injection: when >0, every Nth logical block read raises
+        # RuntimeError. The count is independent of NIXL transaction
+        # batching. Used by the failure-recovery test suite to confirm the
+        # handler propagates failures to vLLM's load policy. Defaults to off.
         self._fault_inject_every = int(fault_inject_every)
         self._read_block_calls = 0
 
@@ -297,23 +301,53 @@ class RawNixlRemoteG2Adapter:
         local_byte_offset: int,
         byte_length: int,
     ) -> None:
-        """Synchronous block-sized READ across **all** layers.
+        """Compatibility wrapper for a one-block synchronous READ."""
+        self.read_blocks(
+            peer_name,
+            peer_byte_offsets=[peer_byte_offset],
+            local_byte_offsets=[local_byte_offset],
+            byte_lengths=[byte_length],
+        )
 
-        Builds a transfer descriptor list with one entry per layer (the
-        peer's layer pool plus its block byte offset, paired with the
-        local layer pool plus the local block byte offset). Issues one
-        ``initialize_xfer`` / ``transfer`` / completion poll covering
-        the full block.
+    def read_blocks(
+        self,
+        peer_name: str,
+        peer_byte_offsets: Sequence[int],
+        local_byte_offsets: Sequence[int],
+        byte_lengths: Sequence[int],
+    ) -> None:
+        """Synchronously READ aligned logical blocks across every layer.
+
+        The three input sequences are positionally aligned and retain their
+        caller-provided order. Descriptor lists use block-major, layer-minor
+        order on both sides. Logical blocks are chunked so a transfer never
+        contains more than ``max_blocks_per_xfer * num_layers`` descriptors.
+
+        Fault injection continues to count logical blocks, not NIXL
+        transactions. If an injected failure falls inside this call, blocks
+        preceding it are transferred and the injected block plus all later
+        blocks are skipped, matching the former per-block loop.
         """
+        block_count = len(peer_byte_offsets)
+        if len(local_byte_offsets) != block_count or len(byte_lengths) != block_count:
+            raise ValueError(
+                "peer/local offsets and byte_lengths must have equal length"
+            )
+        if block_count == 0:
+            return
+
+        peer_offsets = [int(value) for value in peer_byte_offsets]
+        local_offsets = [int(value) for value in local_byte_offsets]
+        lengths = [int(value) for value in byte_lengths]
+
         with self._lock:
             peer = self._peers.get(peer_name)
-            self._read_block_calls += 1
-            inject = (
-                self._fault_inject_every > 0
-                and self._read_block_calls % self._fault_inject_every == 0
-            )
-        if peer is None:
-            raise RuntimeError(f"peer {peer_name!r} not registered; call add_peer")
+            if peer is None:
+                # The old per-block implementation counted the first attempted
+                # read before reporting a missing peer, then stopped the job.
+                self._read_block_calls += 1
+                raise RuntimeError(f"peer {peer_name!r} not registered; call add_peer")
+            peer = dict(peer)
 
         peer_layer_bases = peer["layer_bases"]
         n_layers = len(peer_layer_bases)
@@ -323,44 +357,77 @@ class RawNixlRemoteG2Adapter:
                 f"local {self.num_layers}"
             )
 
-        if inject:
-            raise RuntimeError(
-                f"RemoteG2 fault injection: read_block #{self._read_block_calls}"
+        peer_layer_sizes = peer["layer_sizes"]
+        peer_limit = min(int(size) for size in peer_layer_sizes)
+        local_limit = min(self._local_layer_sizes)
+        for index, (peer_offset, local_offset, length) in enumerate(
+            zip(peer_offsets, local_offsets, lengths)
+        ):
+            if peer_offset < 0 or local_offset < 0:
+                raise ValueError(f"block {index} has a negative byte offset")
+            if length <= 0:
+                raise ValueError(f"block {index} byte_length must be positive")
+            if peer_offset + length > peer_limit:
+                raise ValueError(
+                    f"block {index} exceeds peer layer pool: "
+                    f"offset={peer_offset} length={length} limit={peer_limit}"
+                )
+            if local_offset + length > local_limit:
+                raise ValueError(
+                    f"block {index} exceeds local layer pool: "
+                    f"offset={local_offset} length={length} limit={local_limit}"
+                )
+
+        inject_index: int | None = None
+        inject_call = 0
+        with self._lock:
+            for index in range(block_count):
+                self._read_block_calls += 1
+                if (
+                    self._fault_inject_every > 0
+                    and self._read_block_calls % self._fault_inject_every == 0
+                ):
+                    inject_index = index
+                    inject_call = self._read_block_calls
+                    break
+
+        transfer_count = block_count if inject_index is None else inject_index
+        if transfer_count:
+            self._read_blocks_impl(
+                peer_name,
+                peer,
+                peer_offsets[:transfer_count],
+                local_offsets[:transfer_count],
+                lengths[:transfer_count],
             )
+
+        if inject_index is not None:
+            raise RuntimeError(f"RemoteG2 fault injection: read_block #{inject_call}")
+
+    def _read_blocks_impl(
+        self,
+        peer_name: str,
+        peer: dict[str, Any],
+        peer_offsets: Sequence[int],
+        local_offsets: Sequence[int],
+        lengths: Sequence[int],
+    ) -> None:
+        peer_layer_bases = peer["layer_bases"]
+        n_layers = len(peer_layer_bases)
 
         if self._use_mock:
             import ctypes
 
-            for i in range(n_layers):
-                ctypes.memmove(
-                    self._local_layer_bases[i] + local_byte_offset,
-                    int(peer_layer_bases[i]) + peer_byte_offset,
-                    byte_length,
-                )
+            for peer_offset, local_offset, length in zip(
+                peer_offsets, local_offsets, lengths
+            ):
+                for layer in range(n_layers):
+                    ctypes.memmove(
+                        self._local_layer_bases[layer] + local_offset,
+                        int(peer_layer_bases[layer]) + peer_offset,
+                        length,
+                    )
             return
-
-        local_descs = self._agent.get_xfer_descs(
-            [
-                (
-                    self._local_layer_bases[i] + local_byte_offset,
-                    byte_length,
-                    self._local_device_id,
-                )
-                for i in range(n_layers)
-            ],
-            mem_type=self._local_mem_type,
-        )
-        remote_descs = self._agent.get_xfer_descs(
-            [
-                (
-                    int(peer_layer_bases[i]) + peer_byte_offset,
-                    byte_length,
-                    peer["peer_device_id"],
-                )
-                for i in range(n_layers)
-            ],
-            mem_type=peer["peer_mem_type"],
-        )
 
         deadline = time.monotonic() + 5.0
         while not self._agent.check_remote_metadata(peer["handle"]):
@@ -370,24 +437,69 @@ class RawNixlRemoteG2Adapter:
                 )
             time.sleep(self._poll_interval_s)
 
+        for start in range(0, len(peer_offsets), self._max_blocks_per_xfer):
+            stop = min(start + self._max_blocks_per_xfer, len(peer_offsets))
+            local_regions: list[tuple[int, int, int]] = []
+            remote_regions: list[tuple[int, int, int]] = []
+            for block in range(start, stop):
+                for layer in range(n_layers):
+                    local_regions.append(
+                        (
+                            self._local_layer_bases[layer] + local_offsets[block],
+                            lengths[block],
+                            self._local_device_id,
+                        )
+                    )
+                    remote_regions.append(
+                        (
+                            int(peer_layer_bases[layer]) + peer_offsets[block],
+                            lengths[block],
+                            peer["peer_device_id"],
+                        )
+                    )
+
+            local_descs = self._agent.get_xfer_descs(
+                local_regions, mem_type=self._local_mem_type
+            )
+            remote_descs = self._agent.get_xfer_descs(
+                remote_regions, mem_type=peer["peer_mem_type"]
+            )
+            self._run_xfer(peer_name, peer["handle"], local_descs, remote_descs)
+
+    def _run_xfer(
+        self,
+        peer_name: str,
+        peer_handle: str,
+        local_descs: Any,
+        remote_descs: Any,
+    ) -> None:
         xfer_handle = self._agent.initialize_xfer(
-            "READ", local_descs, remote_descs, peer["handle"]
+            "READ", local_descs, remote_descs, peer_handle
         )
-        state = self._agent.transfer(xfer_handle)
-        if state == "ERR":
-            self._agent.release_xfer_handle(xfer_handle)
-            raise RuntimeError(f"NIXL transfer post failed for peer {peer_name!r}")
-        while True:
-            state = self._agent.check_xfer_state(xfer_handle)
-            if state == "ERR":
-                self._agent.release_xfer_handle(xfer_handle)
+        transfer_error: BaseException | None = None
+        try:
+            state = self._agent.transfer(xfer_handle)
+            while state == "PROC":
+                time.sleep(self._poll_interval_s)
+                state = self._agent.check_xfer_state(xfer_handle)
+            if state != "DONE":
                 raise RuntimeError(
-                    f"NIXL transfer entered ERR state for peer {peer_name!r}"
+                    f"NIXL transfer for peer {peer_name!r} ended in state {state!r}"
                 )
-            if state == "DONE":
-                break
-            time.sleep(self._poll_interval_s)
-        self._agent.release_xfer_handle(xfer_handle)
+        except BaseException as exc:
+            transfer_error = exc
+            raise
+        finally:
+            try:
+                self._agent.release_xfer_handle(xfer_handle)
+            except Exception:
+                if transfer_error is None:
+                    raise
+                logger.exception(
+                    "RemoteG2: release_xfer_handle failed after transfer error "
+                    "for peer %r",
+                    peer_name,
+                )
 
 
 # --- mock transport helpers ---
