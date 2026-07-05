@@ -1037,9 +1037,9 @@ both.
 | Suite | What it pins down | # tests | Status |
 |---|---|---|---|
 | `test_e2e_smoke.py` | End-to-end load path with mock-NIXL; sanity-checks framework wiring | 4 | ✅ |
-| `test_lease_pin.py` | Pin/unpin balance, TTL expiry, 8-thread / 500-iter concurrency, 1000-lease stress, no slow leak under mixed full/partial/miss workloads | 9 | ✅ |
+| `test_lease_pin.py` | Pin/unpin balance, manual expiry primitive, 8-thread / 500-iter concurrency, 1000-lease stress, no slow leak under explicit-release workloads | 9 | ✅ |
 | `test_plan_miss.py` | All rejection reasons from `resolve_and_lease`: full miss, partial-prefix miss, `wrong_source_worker`, `wrong_source_rank`, `unsupported_plan_version`, `plan_expired`, `invalid_plan`, empty plan, post-release cleanliness | 10 | ✅ |
-| `test_failure_recovery.py` | NIXL fault injection (`fault_inject_every` knob): every-Nth READ raises → `TransferResult.success=False` → the **manager's** state machine recovers cleanly (lease released, resolve cache cleared, no stuck state across consecutive failures). Note: end-to-end propagation into the scheduler's `kv_load_failure_policy` is blocked by the upstream `assert transfer_result.success` in the offloading worker loop — see §4.3 status. | 7 | ✅ |
+| `test_failure_recovery.py` | NIXL fault injection (`fault_inject_every` knob): every-Nth READ raises synchronously from `submit_load`, before model forward; failed jobs never enter the successful completion queue and later independent submissions remain usable. | 8 | ✅ |
 
 **30 / 30 pass.**
 
@@ -1064,9 +1064,9 @@ KV as if we had recomputed". Detailed numbers in `FINDINGS.md`.
 |---|---|
 | Source RPC + plan resolve (cross-worker) | ✅ working |
 | Per-layer (all 36 layers) NIXL READ | ✅ working |
-| Lease pin / unpin / TTL | ✅ working, balanced |
+| Lease pin / unpin | ✅ explicit release working and balanced; automatic TTL reaping is deferred until lease renewal + bounded NIXL abort make it safe |
 | Plan-miss / partial-prefix degradation at the manager state machine | ✅ working, no leases leaked (validated by `test_failure_recovery.py`) |
-| NIXL failure → vLLM `recompute` policy end-to-end | ⚠️ open. Our adapter correctly reports `TransferResult.success=False`, but the upstream offloading worker loop at `vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:273` runs `assert transfer_result.success` before the scheduler's `kv_load_failure_policy` can apply. Tracked as a separate proposal with the offloading-connector owners. |
+| NIXL/CUDA failure before forward | ✅ fail-closed: `submit_load` raises synchronously and does not publish a completion. Graceful `kv_load_failure_policy=recompute` remains separate upstream work. |
 | End-to-end output byte equality vs source reference | ✅ verified (two-engine eval) |
 | Dynamo HTTP frontend + KV router → vLLM workers | ✅ working |
 | Plan emission via POC shim (`kvp2p_plan_inject.py`) | ✅ working — the verified path that produced the 40-block numbers above. Also useful going forward as a deterministic injection knob for testing the data plane without depending on the Router's reuse predicate. |

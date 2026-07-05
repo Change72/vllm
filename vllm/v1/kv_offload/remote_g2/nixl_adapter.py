@@ -202,6 +202,8 @@ class RawNixlRemoteG2Adapter:
             raise ValueError("max_blocks_per_xfer must be positive")
         self._peers: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._closed = False
+        self._local_registration: Any | None = None
         # Fault injection: when >0, every Nth logical block read raises
         # RuntimeError. The count is independent of NIXL transaction
         # batching. Used by the failure-recovery test suite to confirm the
@@ -220,8 +222,22 @@ class RawNixlRemoteG2Adapter:
             (p, s, self._local_device_id, "")
             for p, s in zip(self._local_layer_bases, self._local_layer_sizes)
         ]
-        self._agent.register_memory(reg_list, mem_type=self._local_mem_type)
-        self._agent_metadata = self._agent.get_agent_metadata()
+        self._local_registration = self._agent.register_memory(
+            reg_list, mem_type=self._local_mem_type
+        )
+        try:
+            self._agent_metadata = self._agent.get_agent_metadata()
+        except Exception:
+            # Registration pins the local allocation.  Roll it back if the
+            # constructor cannot finish so callers may safely drop the tensor.
+            try:
+                self.close()
+            except Exception:
+                logger.exception(
+                    "RemoteG2: deregister_memory failed while rolling back "
+                    "target adapter construction"
+                )
+            raise
 
     @property
     def agent_metadata(self) -> bytes:
@@ -249,6 +265,22 @@ class RawNixlRemoteG2Adapter:
             return "MOCK"
         return ",".join(self._backends) if self._backends else "MOCK"
 
+    def close(self) -> None:
+        """Deregister the local destination pools exactly once.
+
+        Callers must drain all transfers that reference these addresses before
+        closing the adapter.  The mock transport owns no NIXL registration.
+        """
+
+        with self._lock:
+            if self._closed:
+                return
+            registration = self._local_registration
+            if not self._use_mock and registration is not None:
+                self._agent.deregister_memory(registration)
+            self._local_registration = None
+            self._closed = True
+
     def add_peer(
         self,
         peer_name: str,
@@ -270,6 +302,8 @@ class RawNixlRemoteG2Adapter:
                 f"local adapter has {self.num_layers} (model mismatch?)"
             )
         with self._lock:
+            if self._closed:
+                raise RuntimeError("RemoteG2 target adapter is closed")
             if peer_name in self._peers:
                 return
             if self._use_mock:
@@ -341,6 +375,8 @@ class RawNixlRemoteG2Adapter:
         lengths = [int(value) for value in byte_lengths]
 
         with self._lock:
+            if self._closed:
+                raise RuntimeError("RemoteG2 target adapter is closed")
             peer = self._peers.get(peer_name)
             if peer is None:
                 # The old per-block implementation counted the first attempted

@@ -345,6 +345,15 @@ class SourceG2DescriptorRegistry:
         # gate can convert single-layer logical bytes into approx wire bytes.)
         self.transport_backend: str = "unset"
         self.transport_mock: bool = True
+        self.transport_mode: str = "unset"
+        # Host-bounce-specific completion counters.  These are incremented by
+        # the target handler only after all H2D slot events have completed, or
+        # on the synchronous fail-closed error path.  They let a perf gate prove
+        # that an apparently successful request actually used the opt-in E5
+        # path instead of silently falling back to direct VRAM or recompute.
+        self.host_bounce_jobs_completed: int = 0
+        self.host_bounce_bytes_completed: int = 0
+        self.host_bounce_failures: int = 0
 
         # Source-side eviction protection. A lease must use the owning
         # CPUOffloadingManager's complete ref-count transition, not mutate
@@ -445,12 +454,25 @@ class SourceG2DescriptorRegistry:
     def num_layers(self) -> int:
         return len(self._layer_pool_base_ptrs)
 
-    def set_transport_info(self, *, backend: str, mock: bool) -> None:
+    def set_transport_info(
+        self, *, backend: str, mock: bool, mode: str = "direct_vram"
+    ) -> None:
         """Record the target-side READ transport (called by the spec once
         the NIXL adapter is built). Read back over the stats RPC by the
         fail-closed perf gate to reject a mock-memcpy fallback."""
         self.transport_backend = str(backend)
         self.transport_mock = bool(mock)
+        self.transport_mode = str(mode)
+
+    def record_host_bounce_result(self, success: bool, num_bytes: int) -> None:
+        """Record one terminal host-bounce transfer outcome."""
+
+        with self._lock:
+            if success:
+                self.host_bounce_jobs_completed += 1
+                self.host_bounce_bytes_completed += int(num_bytes)
+            else:
+                self.host_bounce_failures += 1
 
     def record_completed_load(self, bytes_emitted: int, source_worker_id: int) -> bool:
         """Count one completed plan-driven load. Returns whether it counted.

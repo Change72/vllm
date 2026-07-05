@@ -5,19 +5,19 @@
 The adapter exposes a ``fault_inject_every`` knob: every Nth logical
 block raises ``RuntimeError`` instead of moving data, independent of
 how blocks are grouped into NIXL transactions.
-The transfer handler must propagate this as a failed
-``TransferResult`` so vLLM's scheduler can apply the configured
-``kv_load_failure_policy`` (``fail`` or ``recompute``).
+The transfer handler must raise synchronously from ``submit_load``.  The
+offloading connector invokes that method before model forward; deferring the
+failure to ``get_finished`` would let stale or partially-written KV participate
+in one forward pass before the connector notices the failed result.
 
 These tests pin down the contract end-to-end without standing up a
 real vLLM engine:
 
-* ``submit_load`` returns True (it accepted the spec) but the
-  enqueued ``TransferResult.success`` is False after the failure.
-* ``get_finished`` returns the failed result exactly once.
+* A failed READ raises before ``submit_load`` returns.
+* Failed jobs never appear in the successful completion queue.
 * Subsequent transfers after a failure recover (no stuck state).
-* When *every* read fails (fault_inject_every=1) every job is
-  reported as failed; no partial-success masquerades as success.
+* When *every* read fails (fault_inject_every=1), no partial-success
+  masquerades as success.
 """
 
 from __future__ import annotations
@@ -159,17 +159,14 @@ def test_happy_path_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
         assert bytes(tgt_pools[layer]) == bytes(src_pools[layer])
 
 
-def test_every_read_fails_returns_failure() -> None:
+def test_every_read_fails_before_forward() -> None:
     """fault_inject_every=1 -> every call raises -> the FIRST read
     in the job fails, the rest are skipped, success=False."""
     handler, _adapter, _src, _tgt = _make_handler(fault_inject_every=1)
     src, dst = _spec_for([0, 1])
-    assert handler.submit_load(202, src, dst) is True
-    finished = handler.get_finished()
-    assert len(finished) == 1
-    assert finished[0].job_id == 202
-    assert finished[0].success is False
-    assert finished[0].transfer_size == 0
+    with pytest.raises(RuntimeError, match="NIXL READ failed"):
+        handler.submit_load(202, src, dst)
+    assert handler.get_finished() == []
 
 
 def test_one_failure_then_recovery() -> None:
@@ -181,15 +178,12 @@ def test_one_failure_then_recovery() -> None:
     src1, dst1 = _spec_for([0, 1])
     src2, dst2 = _spec_for([2, 3])
 
-    handler.submit_load(301, src1, dst1)
-    handler.submit_load(302, src2, dst2)
-    results = sorted(handler.get_finished(), key=lambda r: r.job_id)
-    # At least one job must have failed (the read where the counter
-    # hit a multiple of 3); the other completes successfully.
-    successes = [r for r in results if r.success]
-    failures = [r for r in results if not r.success]
-    assert len(failures) == 1
-    assert len(successes) == 1
+    assert handler.submit_load(301, src1, dst1) is True
+    with pytest.raises(RuntimeError, match="NIXL READ failed"):
+        handler.submit_load(302, src2, dst2)
+    results = handler.get_finished()
+    assert [result.job_id for result in results] == [301]
+    assert results[0].success is True
 
     # Subsequent transfers complete cleanly (handler isn't stuck).
     src3, dst3 = _spec_for([0])
@@ -215,24 +209,20 @@ def test_get_finished_is_idempotent_drain() -> None:
     assert second == []
 
 
-def test_missing_peer_fails_gracefully() -> None:
-    """If ensure_peer returns False, the job is reported as failed
-    without raising up to the worker."""
+def test_missing_peer_fails_before_forward() -> None:
     handler, _adapter, _src, _tgt = _make_handler()
     # Replace ensure_peer with one that always says no.
     handler._ensure_peer = lambda peer_name: False
     src, dst = _spec_for([0, 1])
-    assert handler.submit_load(501, src, dst) is True
-    results = handler.get_finished()
-    assert len(results) == 1
-    assert results[0].success is False
-    assert results[0].transfer_size == 0
+    with pytest.raises(RuntimeError, match="metadata not available"):
+        handler.submit_load(501, src, dst)
+    assert handler.get_finished() == []
 
 
 def test_block_count_mismatch_rejected_synchronously() -> None:
     """Mismatched src/dst block counts is a programmer error; we
-    surface it via submit_load returning False (rather than
-    enqueueing a fake failure result)."""
+    surface it by raising before forward (rather than enqueueing a deferred
+    failure result)."""
     handler, _adapter, _src, _tgt = _make_handler()
     src, _dst = _spec_for([0, 1])
     # Build a DST spec with a different cardinality.
@@ -241,8 +231,8 @@ def test_block_count_mismatch_rejected_synchronously() -> None:
         group_sizes=[3],
         block_indices=[0],
     )
-    assert handler.submit_load(601, src, bad_dst) is False
-    # No result enqueued — the caller never claimed acceptance.
+    with pytest.raises(RuntimeError, match="block count mismatch"):
+        handler.submit_load(601, src, bad_dst)
     assert handler.get_finished() == []
 
 
@@ -252,6 +242,41 @@ def test_wrong_spec_types_rejected() -> None:
     bad_src = object()
     dst = GPULoadStoreSpec(block_ids=[0], group_sizes=[1], block_indices=[0])
     assert handler.submit_load(701, bad_src, dst) is False  # type: ignore[arg-type]
+
+
+def test_cuda_completion_failure_raises_before_forward_and_releases_source_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    class _DirectAdapter:
+        use_mock = False
+
+        def read_blocks(self, *args, **kwargs) -> None:
+            return
+
+        def close(self) -> None:
+            return
+
+    released: list[str] = []
+    handler = RemoteG2TransferHandler(
+        adapter=_DirectAdapter(),  # type: ignore[arg-type]
+        gpu_page_size_bytes=PAGE_SIZE,
+        ensure_peer=lambda _peer: True,
+        on_load_done=released.append,
+    )
+
+    def fail_sync() -> None:
+        raise RuntimeError("sync failed")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", fail_sync)
+    src, dst = _spec_for([0])
+
+    with pytest.raises(RuntimeError, match="CUDA completion failed"):
+        handler.submit_load(801, src, dst)
+
+    assert released == ["L"]
+    assert handler.get_finished() == []
 
 
 if __name__ == "__main__":

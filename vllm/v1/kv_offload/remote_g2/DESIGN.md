@@ -121,8 +121,10 @@ Two constraints we hold ourselves to:
    It preserves source/destination block pairing, flattens every block's
    layers into aligned descriptor lists, and issues bounded multi-block
    NIXL `initialize_xfer(READ)` transactions (64 blocks by default).
-7. On request finish or lease TTL, target sends `release_lease(id)`;
-   source decrements `_policy[key].ref_cnt`, eviction is unblocked.
+7. After the transfer is known terminal (or on request cleanup), target sends
+   `release_lease(id)`; source decrements `_policy[key].ref_cnt`, eviction is
+   unblocked. The lease records an expiry timestamp for diagnostics/tests, but
+   production does not auto-expire it while an unbounded READ may still live.
 
 ### 3.3 Singletons & process layout
 
@@ -180,10 +182,12 @@ recycled bytes, the registry holds an explicit pin: for each resolved
 descriptor, `_policy[key].ref_cnt += 1`. `LRUCachePolicy.evict` skips
 blocks with `ref_cnt > 0`.
 
-Lease state is bounded:
-- TTL-based reaping (default 30 s) drops stale leases server-side.
+Lease state is explicit:
 - Successful target release (`release_lease(id, "ack")`) on request
   finish is the fast path.
+- Automatic wall-clock reaping is intentionally disabled until the protocol
+  has lease renewal plus a bounded NIXL abort guarantee; otherwise a reaper
+  could unpin source memory during an active READ.
 - Test surface: `tests/.../test_lease_pin.py` exercises 8-thread /
   500-iter concurrency, 1000-lease stress, and balance invariants.
 
@@ -234,22 +238,16 @@ case, the worker behaves like a vanilla `CPUOffloadingSpec`.
 - Source RPC errors → `TargetG2RpcClient` returns `None` / empty
   result → manager falls through to local compute; request still
   succeeds.
-- NIXL READ failure → `TransferResult.success=False`. Our adapter
-  reports this faithfully and the manager's own state machine
-  recovers cleanly (leases released, resolve cache cleared, no
-  stuck state) — validated by `tests/.../test_failure_recovery.py`
-  with the `fault_inject_every` knob.
-
-  Open gap (tracked separately): the upstream offloading worker loop
-  at `vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:273`
-  runs `assert transfer_result.success` before the scheduler's
-  `kv_load_failure_policy` (`fail` / `recompute`) has a chance to
-  apply. A real NIXL fault would therefore crash the worker with
-  AssertionError rather than degrade gracefully. The fix is upstream
-  coordination — replace the assert with a path that surfaces
-  failure to the scheduler, or opt-in failure tolerance per
-  connector. This blocks the "end-to-end recompute on failure"
-  claim, not anything in this connector.
+- NIXL READ or CUDA completion failure raises synchronously from
+  `submit_load`, which is called before model forward. Failed jobs are not
+  queued as deferred `TransferResult`s, so stale or partially-written KV
+  cannot participate in one forward pass before the connector notices.
+  This is fail-closed (the request/engine step fails rather than silently
+  recomputing); recovery through `kv_load_failure_policy` remains separate
+  upstream work. If a failed NIXL call cannot prove remote source access is
+  terminal, its source lease is deliberately retained until explicit cleanup
+  or process teardown. A wall-clock reaper is unsafe without lease renewal and
+  a bounded NIXL abort: it could unpin a block while a long READ is still live.
 - Source policy_missing_block / non_live / wrong_owner →
   `pin_failed`/`missing`/`wrong_owner` reasons returned in the
   per-block status; target drops the affected suffix.

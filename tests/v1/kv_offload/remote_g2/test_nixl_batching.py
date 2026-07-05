@@ -26,11 +26,19 @@ class _FakeNixlAgent:
         self.poll_states: deque[object] = deque()
         self.transfer_error: BaseException | None = None
         self.release_error: BaseException | None = None
+        self.registration = object()
+        self.deregistered: list[object] = []
+        self.metadata_error: BaseException | None = None
 
-    def register_memory(self, regions, *, mem_type: str) -> None:
-        return
+    def register_memory(self, regions, *, mem_type: str):
+        return self.registration
+
+    def deregister_memory(self, registration) -> None:
+        self.deregistered.append(registration)
 
     def get_agent_metadata(self) -> bytes:
+        if self.metadata_error is not None:
+            raise self.metadata_error
         return b"fake-target-metadata"
 
     def add_remote_agent(self, metadata: bytes) -> str:
@@ -352,3 +360,31 @@ def test_invalid_batch_size_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(nixl_adapter, "nixl_agent", lambda *args, **kwargs: None)
     with pytest.raises(ValueError, match="max_blocks_per_xfer must be positive"):
         RawNixlRemoteG2Adapter("target", [1_000], [1_000], max_blocks_per_xfer=0)
+
+
+def test_close_deregisters_local_memory_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake, _local_bases, _peer_bases = _real_adapter(monkeypatch)
+
+    adapter.close()
+    adapter.close()
+
+    assert fake.deregistered == [fake.registration]
+    with pytest.raises(RuntimeError, match="adapter is closed"):
+        adapter.read_block("source", 0, 0, 16)
+
+
+def test_constructor_metadata_failure_rolls_back_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeNixlAgent()
+    fake.metadata_error = RuntimeError("metadata failed")
+    monkeypatch.setattr(nixl_adapter, "NIXL_AVAILABLE", True)
+    monkeypatch.setattr(nixl_adapter, "nixl_agent_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(nixl_adapter, "nixl_agent", lambda *args, **kwargs: fake)
+
+    with pytest.raises(RuntimeError, match="metadata failed"):
+        RawNixlRemoteG2Adapter("target", [1_000], [8_192])
+
+    assert fake.deregistered == [fake.registration]

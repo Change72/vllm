@@ -26,6 +26,10 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.remote_g2.host_bounce import (
+    HostBounceTransferError,
+    RemoteG2HostBounceTransport,
+)
 from vllm.v1.kv_offload.remote_g2.load_spec import RemoteG2LoadSpec
 from vllm.v1.kv_offload.remote_g2.nixl_adapter import RawNixlRemoteG2Adapter
 
@@ -48,9 +52,9 @@ class RemoteG2TransferHandler:
     handshake via the supplied ``ensure_peer`` callback.
 
     The transfer is performed synchronously inside ``submit_load``
-    (POC simplification): blocks are READ in submission order, success
-    or failure is queued for ``get_finished``. M4 can switch to a real
-    async pump using NIXL's ``post()`` + completion polling.
+    (POC simplification): blocks are READ in submission order and successful
+    completion is queued for ``get_finished``. Any transfer/completion failure
+    raises synchronously so stale KV cannot reach the subsequent forward pass.
     """
 
     def __init__(
@@ -60,15 +64,29 @@ class RemoteG2TransferHandler:
         gpu_page_size_bytes: int,
         ensure_peer: Callable[[str], bool],
         on_load_done: Callable[[str], None] | None = None,
+        host_bounce: RemoteG2HostBounceTransport | None = None,
+        on_host_bounce_result: Callable[[bool, int], None] | None = None,
     ) -> None:
         self._adapter = adapter
         self._gpu_page_size = int(gpu_page_size_bytes)
         self._ensure_peer = ensure_peer
         self._on_load_done = on_load_done
+        self._host_bounce = host_bounce
+        self._on_host_bounce_result = on_host_bounce_result
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._shutdown = False
         self._finished: deque[TransferResult] = deque()
 
     def submit_load(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+    ) -> bool:
+        with self._lifecycle_lock:
+            if self._shutdown:
+                raise RuntimeError("RemoteG2 transfer handler is shut down")
+            return self._submit_load_locked(job_id, src_spec, dst_spec)
+
+    def _submit_load_locked(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
     ) -> bool:
         if not isinstance(src_spec, RemoteG2LoadSpec):
@@ -84,24 +102,40 @@ class RemoteG2TransferHandler:
 
         gpu_block_ids = dst_spec.block_ids.tolist()
         if len(src_spec.blocks) != len(gpu_block_ids):
+            message = (
+                "RemoteG2TransferHandler: block count mismatch "
+                f"src={len(src_spec.blocks)} dst={len(gpu_block_ids)}"
+            )
             logger.error(
                 "RemoteG2TransferHandler: block count mismatch src=%d dst=%d",
                 len(src_spec.blocks),
                 len(gpu_block_ids),
             )
-            return False
+            self._release_lease(src_spec.lease_id, success=False)
+            if self._host_bounce is not None:
+                self._record_host_bounce_result(success=False, num_bytes=0)
+            raise RuntimeError(message)
+        if not src_spec.blocks:
+            self._release_lease(src_spec.lease_id, success=False)
+            if self._host_bounce is not None:
+                self._record_host_bounce_result(success=False, num_bytes=0)
+            raise RuntimeError("RemoteG2 load has no blocks")
 
         if not self._ensure_peer(src_spec.peer_name):
-            logger.warning(
-                "RemoteG2 transfer dropped: peer %s metadata not available",
-                src_spec.peer_name,
+            message = (
+                f"RemoteG2 transfer peer {src_spec.peer_name!r} metadata not available"
             )
-            self._enqueue(job_id, success=False, num_bytes=0, elapsed=0.0)
-            return True
+            logger.warning(message)
+            self._release_lease(src_spec.lease_id, success=False)
+            if self._host_bounce is not None:
+                self._record_host_bounce_result(success=False, num_bytes=0)
+            raise RuntimeError(message)
 
         t0 = time.perf_counter()
+        if self._host_bounce is not None:
+            return self._submit_host_bounce(job_id, src_spec, gpu_block_ids, t0)
+
         total_bytes = 0
-        ok = True
         try:
             self._adapter.read_blocks(
                 src_spec.peer_name,
@@ -116,9 +150,12 @@ class RemoteG2TransferHandler:
             # model's layer count when reporting layer-wise wire-equivalent
             # bytes. Only claim bytes after the entire batched load succeeds.
             total_bytes = sum(handle.byte_length for handle in src_spec.blocks)
-        except Exception:
+        except Exception as exc:
             logger.exception("RemoteG2 NIXL READ failed (job_id=%d)", job_id)
-            ok = False
+            # Do not queue a deferred failed result: start_kv_transfers runs
+            # before forward, so a synchronous exception is the only way to
+            # guarantee partial/stale KV cannot reach model execution.
+            raise RuntimeError(f"RemoteG2 NIXL READ failed (job_id={job_id})") from exc
 
         # Force a device synchronization so the bytes UCX wrote into
         # VRAM are visible to subsequent CUDA kernels on the model's
@@ -129,33 +166,107 @@ class RemoteG2TransferHandler:
         # cached block, producing wrong tokens that the *next* forward
         # pass would generate correctly. The sync cost is amortised
         # across the whole batch (one sync per transfer_async call).
-        if ok and total_bytes > 0:
+        if total_bytes > 0 and not self._adapter.use_mock:
             try:
                 import torch
 
                 torch.cuda.synchronize()
-            except Exception:
-                logger.warning(
+            except Exception as exc:
+                logger.exception(
                     "RemoteG2: torch.cuda.synchronize after NIXL READ "
-                    "failed (job_id=%d); subsequent forward may observe "
-                    "stale GPU bytes",
+                    "failed (job_id=%d); rejecting the load",
                     job_id,
-                    exc_info=True,
                 )
+                # The synchronous NIXL READ already returned, so source DRAM
+                # is no longer in use even though local VRAM completion failed.
+                self._release_lease(src_spec.lease_id, success=False)
+                raise RuntimeError(
+                    f"RemoteG2 CUDA completion failed (job_id={job_id})"
+                ) from exc
 
         elapsed = time.perf_counter() - t0
-        self._enqueue(job_id, success=ok, num_bytes=total_bytes, elapsed=elapsed)
-
-        if ok and self._on_load_done is not None and src_spec.lease_id is not None:
-            try:
-                self._on_load_done(src_spec.lease_id)
-            except Exception:
-                logger.exception(
-                    "RemoteG2 lease release callback raised "
-                    "(lease_id=%s); source TTL will clean up",
-                    src_spec.lease_id,
-                )
+        self._release_lease(src_spec.lease_id, success=True)
+        self._enqueue(job_id, success=True, num_bytes=total_bytes, elapsed=elapsed)
         return True
+
+    def _submit_host_bounce(
+        self,
+        job_id: int,
+        src_spec: RemoteG2LoadSpec,
+        gpu_block_ids: list[int],
+        started: float,
+    ) -> bool:
+        assert self._host_bounce is not None
+        try:
+            stats = self._host_bounce.transfer(
+                src_spec.peer_name,
+                peer_byte_offsets=[handle.byte_offset for handle in src_spec.blocks],
+                gpu_block_ids=gpu_block_ids,
+                byte_lengths=[handle.byte_length for handle in src_spec.blocks],
+            )
+        except Exception as exc:
+            # The source lease protects remote DRAM, not the local bounce
+            # buffer. Release it once the NIXL READ is known terminal even if
+            # local CUDA drain failed; retain it only when remote access itself
+            # is uncertain, until explicit cleanup or source process teardown.
+            safe_to_release = not isinstance(exc, HostBounceTransferError) or (
+                exc.safe_to_release_source_lease
+            )
+            if safe_to_release:
+                self._release_lease(src_spec.lease_id, success=False)
+            self._record_host_bounce_result(success=False, num_bytes=0)
+            logger.exception(
+                "RemoteG2 host-bounce transfer failed before forward (job_id=%d)",
+                job_id,
+            )
+            raise RuntimeError(
+                f"RemoteG2 host-bounce transfer failed (job_id={job_id})"
+            ) from exc
+
+        elapsed = time.perf_counter() - started
+        self._release_lease(src_spec.lease_id, success=True)
+        self._record_host_bounce_result(success=True, num_bytes=stats.logical_bytes)
+        self._enqueue(
+            job_id,
+            success=True,
+            num_bytes=stats.logical_bytes,
+            elapsed=elapsed,
+        )
+        logger.debug(
+            "RemoteG2 host-bounce completed job_id=%d blocks=%d chunks=%d "
+            "bytes=%d read=%.6fs enqueue=%.6fs wait=%.6fs total=%.6fs",
+            job_id,
+            len(src_spec.blocks),
+            stats.chunk_count,
+            stats.logical_bytes,
+            stats.read_seconds,
+            stats.copy_enqueue_seconds,
+            stats.copy_wait_seconds,
+            elapsed,
+        )
+        return True
+
+    def _release_lease(self, lease_id: str | None, *, success: bool) -> None:
+        if self._on_load_done is None or lease_id is None:
+            return
+        try:
+            self._on_load_done(lease_id)
+        except Exception:
+            logger.exception(
+                "RemoteG2 lease release callback raised after %s "
+                "(lease_id=%s); source pin remains until explicit cleanup or "
+                "process teardown",
+                "success" if success else "failure",
+                lease_id,
+            )
+
+    def _record_host_bounce_result(self, *, success: bool, num_bytes: int) -> None:
+        if self._on_host_bounce_result is None:
+            return
+        try:
+            self._on_host_bounce_result(bool(success), int(num_bytes))
+        except Exception:
+            logger.exception("RemoteG2 host-bounce metrics callback failed")
 
     def get_finished(self) -> list[TransferResult]:
         with self._lock:
@@ -169,6 +280,14 @@ class RemoteG2TransferHandler:
         return
 
     def shutdown(self) -> None:
+        with self._lifecycle_lock:
+            if self._shutdown:
+                return
+            if self._host_bounce is not None:
+                self._host_bounce.close()
+            else:
+                self._adapter.close()
+            self._shutdown = True
         with self._lock:
             self._finished.clear()
 
@@ -227,6 +346,7 @@ class RemoteG2OffloadingWorker(CPUOffloadingWorker):
             self.remote_handler.wait(job_ids)
 
     def shutdown(self) -> None:
-        super().shutdown()
         if self.remote_handler is not None:
             self.remote_handler.shutdown()
+            self.remote_handler = None
+        super().shutdown()

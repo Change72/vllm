@@ -40,6 +40,11 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.remote_g2.data_model import RemoteKvReusePlan
+from vllm.v1.kv_offload.remote_g2.host_bounce import (
+    HOST_BOUNCE_SLOT_COUNT,
+    CudaHostBounceCopyEngine,
+    RemoteG2HostBounceTransport,
+)
 from vllm.v1.kv_offload.remote_g2.manager import RemoteG2OffloadingManager
 from vllm.v1.kv_offload.remote_g2.nixl_adapter import (
     NixlSourceBundle,
@@ -92,6 +97,34 @@ def _resolve_bool(extra: dict, key: str, env: str, default: bool) -> bool:
     return _truthy(raw)
 
 
+def _validate_host_bounce_config(
+    *,
+    enabled: bool,
+    tp_size: int,
+    use_v2_model_runner: bool,
+    use_mock_nixl: bool,
+    block_size_factor: int,
+    max_bytes: int,
+) -> None:
+    """Validate the deliberately narrow first E5 deployment contract."""
+
+    if not enabled:
+        return
+    if tp_size != 1:
+        raise ValueError("Remote-G2 host-bounce currently requires TP=1")
+    if use_v2_model_runner:
+        raise ValueError(
+            "Remote-G2 host-bounce currently requires the V1 model runner; "
+            "set VLLM_USE_V2_MODEL_RUNNER=0"
+        )
+    if use_mock_nixl:
+        raise ValueError("Remote-G2 host-bounce requires real NIXL/UCX")
+    if block_size_factor != 1:
+        raise ValueError("Remote-G2 host-bounce currently requires block_size_factor=1")
+    if max_bytes <= 0:
+        raise ValueError("host_bounce_max_bytes must be positive")
+
+
 class _BundleFromPayload:
     """NixlSourceBundle-shaped wrapper around a RemoteG2HandshakePayload.
 
@@ -139,6 +172,10 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
       bytes-memcpy transport even when ``nixl`` is installed (for tests).
     * ``max_blocks_per_xfer`` (env ``REMOTE_G2_MAX_BLOCKS_PER_XFER``) —
       maximum logical blocks in one NIXL transaction; default 64.
+    * ``use_host_bounce`` (env ``REMOTE_G2_USE_HOST_BOUNCE``) — use the
+      same-node two-slot DRAM READ + batched H2D path; default false.
+    * ``host_bounce_max_bytes`` (env ``REMOTE_G2_HOST_BOUNCE_MAX_BYTES``) —
+      startup memory budget for both bounce slots; default 1 GiB.
     * ``lease_ttl_ms`` — default 30_000.
     """
 
@@ -215,6 +252,23 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         )
         if self.max_blocks_per_xfer <= 0:
             raise ValueError("max_blocks_per_xfer must be positive")
+        self.use_host_bounce = _resolve_bool(
+            extra, "use_host_bounce", "REMOTE_G2_USE_HOST_BOUNCE", False
+        )
+        self.host_bounce_max_bytes = _resolve_int(
+            extra,
+            "host_bounce_max_bytes",
+            "REMOTE_G2_HOST_BOUNCE_MAX_BYTES",
+            1 << 30,
+        )
+        _validate_host_bounce_config(
+            enabled=self.use_host_bounce,
+            tp_size=self.tp_size,
+            use_v2_model_runner=vllm_config.use_v2_model_runner,
+            use_mock_nixl=self.use_mock_nixl,
+            block_size_factor=self.block_size_factor,
+            max_bytes=self.host_bounce_max_bytes,
+        )
         self.enable_source_rpc: bool = _truthy(extra.get("enable_source_rpc", True))
         # Dynamic transport: when set, the target resolves a plan's source via
         # the dynamo parent target-bridge (client.direct by the source's real
@@ -258,6 +312,13 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         self._rpc_server: SourceG2RpcServer | None = None
         self._source_bundle: NixlSourceBundle | None = None
         self._target_adapter: RawNixlRemoteG2Adapter | None = None
+        self._host_bounce_transport: RemoteG2HostBounceTransport | None = None
+        self._target_page_size_bytes: int = 0
+        # If startup fails after a NIXL registration whose rollback cannot be
+        # proven, retain the backing allocation until process teardown rather
+        # than risking a dangling registered address.
+        self._failed_host_bounce_adapter: RawNixlRemoteG2Adapter | None = None
+        self._failed_host_bounce_copy_engine: CudaHostBounceCopyEngine | None = None
         self._transfer_handler: RemoteG2TransferHandler | None = None
         # Legacy single-rank client cache (TP=1 path); kept for the
         # existing _ensure_peer code that still keys by worker_id only.
@@ -405,6 +466,10 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
 
         cpu_tensors = worker.cpu_tensors
         if not cpu_tensors:
+            if self.use_host_bounce:
+                raise RuntimeError(
+                    "RemoteG2 host-bounce requires materialized CPU tensors"
+                )
             logger.warning(
                 "RemoteG2OffloadingSpec: no CPU tensors materialised; "
                 "skipping NIXL agent setup."
@@ -424,6 +489,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 f"uniform stride across layers."
             )
         page_size_bytes = layer_page_sizes[0]
+        self._target_page_size_bytes = page_size_bytes
         num_cpu_blocks = int(cpu_tensors[0].shape[0])
         cpu_layer_base_ptrs = [int(t.data_ptr()) for t in cpu_tensors]
         cpu_layer_sizes = [page_size_bytes * int(t.shape[0]) for t in cpu_tensors]
@@ -473,6 +539,10 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         )
         self._source_bundle = bundle
         if bundle is None:
+            if self.use_host_bounce:
+                raise RuntimeError(
+                    "RemoteG2 host-bounce source NIXL setup failed; refusing to start"
+                )
             logger.warning(
                 "RemoteG2OffloadingSpec: source NIXL bundle unavailable; "
                 "peers cannot fetch metadata via get_metadata."
@@ -524,13 +594,22 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 self.source_worker_id,
             )
 
-        # Target-side adapter. Uses the local GPU pool tensors (one per
-        # layer) as the transfer destination.
+        # Target-side adapter. The default path registers the local GPU pool.
+        # The explicit same-node host-bounce path instead registers two chunks
+        # of ordinary DRAM and scatters each completed READ to these GPU pools.
+        gpu_tensors = [t.tensor for t in kv_caches.tensors]
+        gpu_page_sizes = [int(t.page_size_bytes) for t in kv_caches.tensors]
         gpu_layer_bases = [int(t.tensor.data_ptr()) for t in kv_caches.tensors]
         gpu_layer_sizes = [
             int(t.tensor.numel() * t.tensor.element_size()) for t in kv_caches.tensors
         ]
         if len(gpu_layer_bases) != len(cpu_layer_base_ptrs):
+            if self.use_host_bounce:
+                raise RuntimeError(
+                    "RemoteG2 host-bounce CPU/GPU canonical tensor count "
+                    f"mismatch: cpu={len(cpu_layer_base_ptrs)} "
+                    f"gpu={len(gpu_layer_bases)}"
+                )
             logger.warning(
                 "RemoteG2OffloadingSpec: GPU has %d layer tensors but "
                 "CPU pool has %d; target transfers will reject peers "
@@ -539,21 +618,101 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 len(cpu_layer_base_ptrs),
             )
         target_agent_name = f"remote-g2-tgt-{self.source_worker_id}-tp{self.tp_rank}"
-        try:
-            self._target_adapter = RawNixlRemoteG2Adapter(
-                target_agent_name,
-                gpu_layer_bases,
-                gpu_layer_sizes,
-                backends=("UCX",),
-                use_mock=self.use_mock_nixl,
-                max_blocks_per_xfer=self.max_blocks_per_xfer,
+        if self.use_host_bounce:
+            if not gpu_page_sizes or any(
+                size != page_size_bytes for size in gpu_page_sizes
+            ):
+                raise RuntimeError(
+                    "RemoteG2 host-bounce requires uniform CPU/GPU page sizes: "
+                    f"cpu={page_size_bytes} gpu={gpu_page_sizes!r}"
+                )
+            bounce_bytes = (
+                HOST_BOUNCE_SLOT_COUNT * self.max_blocks_per_xfer * sum(gpu_page_sizes)
             )
-        except Exception:
-            logger.exception(
-                "RemoteG2OffloadingSpec: target adapter setup failed; "
-                "remote loads will be unavailable until adapter recovers"
+            if bounce_bytes > self.host_bounce_max_bytes:
+                raise RuntimeError(
+                    "RemoteG2 host-bounce allocation exceeds configured budget: "
+                    f"required={bounce_bytes} limit={self.host_bounce_max_bytes}"
+                )
+
+            copy_engine: CudaHostBounceCopyEngine | None = None
+            adapter: RawNixlRemoteG2Adapter | None = None
+            try:
+                copy_engine = CudaHostBounceCopyEngine(
+                    gpu_tensors,
+                    page_size_bytes=page_size_bytes,
+                    blocks_per_slot=self.max_blocks_per_xfer,
+                )
+                adapter = RawNixlRemoteG2Adapter(
+                    target_agent_name,
+                    copy_engine.layer_pool_base_ptrs,
+                    copy_engine.layer_pool_size_bytes,
+                    backends=("UCX",),
+                    use_mock=False,
+                    local_mem_type="DRAM",
+                    max_blocks_per_xfer=self.max_blocks_per_xfer,
+                )
+                if adapter.use_mock:
+                    raise RuntimeError(
+                        "RemoteG2 host-bounce silently selected mock transport"
+                    )
+                self._host_bounce_transport = RemoteG2HostBounceTransport(
+                    adapter=adapter,
+                    copy_engine=copy_engine,
+                    page_size_bytes=page_size_bytes,
+                    blocks_per_slot=self.max_blocks_per_xfer,
+                )
+                self._target_adapter = adapter
+            except Exception:
+                safe_to_release_buffers = adapter is not None
+                if adapter is not None:
+                    try:
+                        adapter.close()
+                    except Exception:
+                        safe_to_release_buffers = False
+                        self._failed_host_bounce_adapter = adapter
+                        logger.exception(
+                            "RemoteG2 host-bounce adapter rollback failed; "
+                            "retaining registered buffers until process teardown"
+                        )
+                if copy_engine is not None:
+                    if safe_to_release_buffers:
+                        try:
+                            copy_engine.drain(after_error=True)
+                            copy_engine.release()
+                        except Exception:
+                            safe_to_release_buffers = False
+                    if not safe_to_release_buffers:
+                        self._failed_host_bounce_copy_engine = copy_engine
+                logger.exception(
+                    "RemoteG2 host-bounce target setup failed; refusing to start"
+                )
+                raise
+            logger.info(
+                "RemoteG2 host-bounce enabled: slots=%d blocks_per_slot=%d "
+                "page_size=%d layers=%d allocation=%.2f MiB",
+                HOST_BOUNCE_SLOT_COUNT,
+                self.max_blocks_per_xfer,
+                page_size_bytes,
+                len(gpu_tensors),
+                bounce_bytes / (1 << 20),
             )
-            self._target_adapter = None
+        else:
+            try:
+                self._target_adapter = RawNixlRemoteG2Adapter(
+                    target_agent_name,
+                    gpu_layer_bases,
+                    gpu_layer_sizes,
+                    backends=("UCX",),
+                    use_mock=self.use_mock_nixl,
+                    max_blocks_per_xfer=self.max_blocks_per_xfer,
+                )
+            except Exception:
+                logger.exception(
+                    "RemoteG2OffloadingSpec: target adapter setup failed; "
+                    "remote loads will be unavailable until adapter recovers"
+                )
+                self._target_adapter = None
 
         if self._target_adapter is not None:
             gpu_page_size = int(kv_caches.tensors[0].page_size_bytes)
@@ -562,6 +721,12 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                 gpu_page_size_bytes=gpu_page_size,
                 ensure_peer=self._ensure_peer,
                 on_load_done=self._on_load_done,
+                host_bounce=self._host_bounce_transport,
+                on_host_bounce_result=(
+                    manager.registry.record_host_bounce_result
+                    if self.use_host_bounce
+                    else None
+                ),
             )
             # The connector drives a single worker per spec; route
             # RemoteG2LoadSpec loads to this handler from submit_load.
@@ -572,6 +737,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             manager.registry.set_transport_info(
                 backend=self._target_adapter.transport_backend,
                 mock=self._target_adapter.use_mock,
+                mode="host_bounce" if self.use_host_bounce else "direct_vram",
             )
 
     def shutdown(self) -> None:
@@ -777,6 +943,17 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
         if bundle is None:
             return False
         try:
+            if self.use_host_bounce:
+                peer_page_size = int(bundle.get("page_size_bytes", 0))
+                if peer_page_size != self._target_page_size_bytes:
+                    logger.error(
+                        "RemoteG2 host-bounce peer %s page size mismatch: "
+                        "peer=%d local=%d",
+                        peer_name,
+                        peer_page_size,
+                        self._target_page_size_bytes,
+                    )
+                    return False
             # Prefer the multi-layer fields when the peer publishes
             # them; fall back to the legacy single-pool fields wrapped
             # as a one-layer list so the adapter API stays uniform.

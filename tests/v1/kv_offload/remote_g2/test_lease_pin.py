@@ -70,6 +70,12 @@ class _StubPolicy:
         return self._blocks.pop(key)
 
 
+def _ref_count(policy: _StubPolicy, key: bytes) -> int:
+    block = policy.get(key)
+    assert block is not None
+    return block.ref_cnt
+
+
 def _make_registry(
     *,
     lease_ttl_ms: int = 1000,
@@ -99,7 +105,7 @@ def _register_block(
     block_hash: int,
     block_id: int,
 ) -> None:
-    key = f"key{block_hash}".encode("utf-8")
+    key = f"key{block_hash}".encode()
     policy.insert(key, _StubBlock(block_id))
     reg.record_key(block_hash, key)
     reg.upsert_descriptor(
@@ -146,7 +152,7 @@ def test_resolve_pins_and_release_unpins() -> None:
 
     # Before resolve — every block ref_cnt == 0.
     for h in (10, 11, 12):
-        assert policy.get(b"key" + str(h).encode()).ref_cnt == 0
+        assert _ref_count(policy, b"key" + str(h).encode()) == 0
 
     result = reg.resolve_and_lease(_plan([10, 11, 12]))
     assert result.reason == "ok"
@@ -155,13 +161,13 @@ def test_resolve_pins_and_release_unpins() -> None:
 
     # After resolve — every leased block's ref_cnt == 1.
     for h in (10, 11, 12):
-        assert policy.get(b"key" + str(h).encode()).ref_cnt == 1
+        assert _ref_count(policy, b"key" + str(h).encode()) == 1
     assert reg.pin_count_total == 3
     assert reg.unpin_count_total == 0
 
     assert reg.release_lease(result.lease_id) is True
     for h in (10, 11, 12):
-        assert policy.get(b"key" + str(h).encode()).ref_cnt == 0
+        assert _ref_count(policy, b"key" + str(h).encode()) == 0
     assert reg.unpin_count_total == 3
     # Re-release is a no-op.
     assert reg.release_lease(result.lease_id) is False
@@ -181,12 +187,12 @@ def test_partial_resolve_releases_partial_pins() -> None:
     assert result.lease_id is not None
     assert len(result.descriptors) == 2
     # Pins are held on the lease — only released on release_lease.
-    assert policy.get(b"key10").ref_cnt == 1
-    assert policy.get(b"key11").ref_cnt == 1
+    assert _ref_count(policy, b"key10") == 1
+    assert _ref_count(policy, b"key11") == 1
 
     reg.release_lease(result.lease_id)
-    assert policy.get(b"key10").ref_cnt == 0
-    assert policy.get(b"key11").ref_cnt == 0
+    assert _ref_count(policy, b"key10") == 0
+    assert _ref_count(policy, b"key11") == 0
 
 
 def test_first_block_missing_releases_no_pin() -> None:
@@ -198,7 +204,7 @@ def test_first_block_missing_releases_no_pin() -> None:
     result = reg.resolve_and_lease(_plan([99, 11]))
     assert result.lease_id is None
     assert len(result.descriptors) == 0
-    assert policy.get(b"key11").ref_cnt == 0
+    assert _ref_count(policy, b"key11") == 0
     # No pins taken, no unpins logged.
     assert reg.pin_count_total == 0
 
@@ -223,13 +229,13 @@ def test_pin_failure_after_eviction_in_middle() -> None:
     assert result.lease_id is not None
     assert len(result.descriptors) == 1
     assert result.descriptors[0].block_hash == 10
-    assert policy.get(b"key10").ref_cnt == 1
+    assert _ref_count(policy, b"key10") == 1
     # 11 was missing from policy → no ref_cnt change.
     # 12 never got resolved.
-    assert policy.get(b"key12").ref_cnt == 0
+    assert _ref_count(policy, b"key12") == 0
 
     reg.release_lease(result.lease_id)
-    assert policy.get(b"key10").ref_cnt == 0
+    assert _ref_count(policy, b"key10") == 0
 
 
 # --- eviction protection ---
@@ -269,18 +275,18 @@ def test_ttl_expiry_releases_pins() -> None:
 
     result = reg.resolve_and_lease(_plan([10, 11]))
     assert result.lease_id is not None
-    assert policy.get(b"key10").ref_cnt == 1
+    assert _ref_count(policy, b"key10") == 1
 
     # Time passes within TTL — no expiry.
     clk[0] = 50
     assert reg.expire_stale_leases() == 0
-    assert policy.get(b"key10").ref_cnt == 1
+    assert _ref_count(policy, b"key10") == 1
 
     # Time passes past TTL.
     clk[0] = 200
     assert reg.expire_stale_leases() == 1
-    assert policy.get(b"key10").ref_cnt == 0
-    assert policy.get(b"key11").ref_cnt == 0
+    assert _ref_count(policy, b"key10") == 0
+    assert _ref_count(policy, b"key11") == 0
     # Lease entry is gone — re-releasing returns False.
     assert reg.release_lease(result.lease_id) is False
 
@@ -320,7 +326,7 @@ def test_concurrent_resolve_and_release_pin_balance() -> None:
     assert not errors, errors[:5]
     # Final state: every block back to ref_cnt 0, every lease cleared.
     for h in range(8):
-        assert policy.get(b"key" + str(h).encode()).ref_cnt == 0
+        assert _ref_count(policy, b"key" + str(h).encode()) == 0
     assert len(reg._leases) == 0
     assert reg.pin_count_total == reg.unpin_count_total
     assert reg.pin_count_total == n_threads * iters * 8
@@ -406,9 +412,7 @@ def test_concurrent_resolve_under_eviction_attempts() -> None:
     for h in block_hashes:
         block = policy.get(b"key" + str(h).encode())
         if block is not None:
-            assert block.ref_cnt == 0, (
-                f"block {h} leaked pin: ref_cnt={block.ref_cnt}"
-            )
+            assert block.ref_cnt == 0, f"block {h} leaked pin: ref_cnt={block.ref_cnt}"
 
 
 # --- stress: many concurrent leases ---
@@ -430,12 +434,12 @@ def test_thousand_concurrent_leases() -> None:
 
     # Every block pinned exactly once.
     for h in range(n_blocks):
-        assert policy.get(b"key" + str(h).encode()).ref_cnt == 1
+        assert _ref_count(policy, b"key" + str(h).encode()) == 1
 
     for lid in leases:
         assert reg.release_lease(lid) is True
     for h in range(n_blocks):
-        assert policy.get(b"key" + str(h).encode()).ref_cnt == 0
+        assert _ref_count(policy, b"key" + str(h).encode()) == 0
     assert reg.pin_count_total == reg.unpin_count_total == n_blocks
 
 

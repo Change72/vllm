@@ -248,19 +248,20 @@ class SourceG2RpcServer:
         sample_limit = int(payload.get("sample_limit", 5))
         with self._registry._lock:
             records = list(self._registry._records.items())
-        target_stats: dict[str, int] = {}
-        for attr in (
-            "plan_seen_count",
-            "plan_resolved_count",
-            "plan_load_specs_emitted",
-            "plan_blocks_loaded",
-            "plan_loads_completed",
-            "plan_bytes_completed",
-        ):
-            target_stats[attr] = int(getattr(self._registry, attr, 0))
-        return {
-            "ok": True,
-            "result": {
+            target_stats: dict[str, int] = {}
+            for attr in (
+                "plan_seen_count",
+                "plan_resolved_count",
+                "plan_load_specs_emitted",
+                "plan_blocks_loaded",
+                "plan_loads_completed",
+                "plan_bytes_completed",
+                "host_bounce_jobs_completed",
+                "host_bounce_bytes_completed",
+                "host_bounce_failures",
+            ):
+                target_stats[attr] = int(getattr(self._registry, attr, 0))
+            result = {
                 "descriptor_count": len(records),
                 "lease_count": len(self._registry._leases),
                 "source_worker_id": self._registry.source_worker_id,
@@ -275,6 +276,9 @@ class SourceG2RpcServer:
                     getattr(self._registry, "transport_backend", "unset")
                 ),
                 "transport_mock": bool(getattr(self._registry, "transport_mock", True)),
+                "transport_mode": str(
+                    getattr(self._registry, "transport_mode", "unset")
+                ),
                 "num_layers": int(getattr(self._registry, "num_layers", 0)),
                 "boot_id": str(getattr(self._registry, "boot_id", "")),
                 "completed_loads_by_source": {
@@ -291,8 +295,8 @@ class SourceG2RpcServer:
                 },
                 "hash_to_key_count": len(self._registry._hash_to_key),
                 "policy_registered": self._registry._policy is not None,
-            },
-        }
+            }
+        return {"ok": True, "result": result}
 
     def _handle_resolve(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         plan = payload.get("plan")
