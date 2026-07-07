@@ -105,6 +105,7 @@ def _validate_host_bounce_config(
     use_mock_nixl: bool,
     block_size_factor: int,
     max_bytes: int,
+    slot_count: int,
 ) -> None:
     """Validate the deliberately narrow first E5 deployment contract."""
 
@@ -123,6 +124,8 @@ def _validate_host_bounce_config(
         raise ValueError("Remote-G2 host-bounce currently requires block_size_factor=1")
     if max_bytes <= 0:
         raise ValueError("host_bounce_max_bytes must be positive")
+    if slot_count not in (1, HOST_BOUNCE_SLOT_COUNT):
+        raise ValueError("host_bounce_slot_count must be 1 or 2")
 
 
 class _BundleFromPayload:
@@ -176,6 +179,9 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
       same-node two-slot DRAM READ + batched H2D path; default false.
     * ``host_bounce_max_bytes`` (env ``REMOTE_G2_HOST_BOUNCE_MAX_BYTES``) —
       startup memory budget for both bounce slots; default 1 GiB.
+    * ``host_bounce_slot_count`` (env ``REMOTE_G2_HOST_BOUNCE_SLOT_COUNT``) —
+      one slot for strictly serial READ/H2D or two for double-buffered overlap;
+      default 2.
     * ``lease_ttl_ms`` — default 30_000.
     """
 
@@ -261,6 +267,12 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             "REMOTE_G2_HOST_BOUNCE_MAX_BYTES",
             1 << 30,
         )
+        self.host_bounce_slot_count = _resolve_int(
+            extra,
+            "host_bounce_slot_count",
+            "REMOTE_G2_HOST_BOUNCE_SLOT_COUNT",
+            HOST_BOUNCE_SLOT_COUNT,
+        )
         _validate_host_bounce_config(
             enabled=self.use_host_bounce,
             tp_size=self.tp_size,
@@ -268,6 +280,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             use_mock_nixl=self.use_mock_nixl,
             block_size_factor=self.block_size_factor,
             max_bytes=self.host_bounce_max_bytes,
+            slot_count=self.host_bounce_slot_count,
         )
         self.enable_source_rpc: bool = _truthy(extra.get("enable_source_rpc", True))
         # Dynamic transport: when set, the target resolves a plan's source via
@@ -627,7 +640,9 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                     f"cpu={page_size_bytes} gpu={gpu_page_sizes!r}"
                 )
             bounce_bytes = (
-                HOST_BOUNCE_SLOT_COUNT * self.max_blocks_per_xfer * sum(gpu_page_sizes)
+                self.host_bounce_slot_count
+                * self.max_blocks_per_xfer
+                * sum(gpu_page_sizes)
             )
             if bounce_bytes > self.host_bounce_max_bytes:
                 raise RuntimeError(
@@ -642,6 +657,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                     gpu_tensors,
                     page_size_bytes=page_size_bytes,
                     blocks_per_slot=self.max_blocks_per_xfer,
+                    slot_count=self.host_bounce_slot_count,
                 )
                 adapter = RawNixlRemoteG2Adapter(
                     target_agent_name,
@@ -661,6 +677,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
                     copy_engine=copy_engine,
                     page_size_bytes=page_size_bytes,
                     blocks_per_slot=self.max_blocks_per_xfer,
+                    slot_count=self.host_bounce_slot_count,
                 )
                 self._target_adapter = adapter
             except Exception:
@@ -691,7 +708,7 @@ class RemoteG2OffloadingSpec(CPUOffloadingSpec):
             logger.info(
                 "RemoteG2 host-bounce enabled: slots=%d blocks_per_slot=%d "
                 "page_size=%d layers=%d allocation=%.2f MiB",
-                HOST_BOUNCE_SLOT_COUNT,
+                self.host_bounce_slot_count,
                 self.max_blocks_per_xfer,
                 page_size_bytes,
                 len(gpu_tensors),

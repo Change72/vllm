@@ -34,6 +34,7 @@ def _validate(
     use_mock_nixl: bool = False,
     block_size_factor: int = 1,
     max_bytes: int = 1 << 30,
+    slot_count: int = 2,
 ) -> None:
     _validate_host_bounce_config(
         enabled=enabled,
@@ -42,6 +43,7 @@ def _validate(
         use_mock_nixl=use_mock_nixl,
         block_size_factor=block_size_factor,
         max_bytes=max_bytes,
+        slot_count=slot_count,
     )
 
 
@@ -80,13 +82,15 @@ def test_host_bounce_disabled_is_a_noop(
 
 
 def test_host_bounce_accepts_the_supported_contract() -> None:
-    _validate(
-        tp_size=1,
-        use_v2_model_runner=False,
-        use_mock_nixl=False,
-        block_size_factor=1,
-        max_bytes=512 << 20,
-    )
+    for slot_count in (1, 2):
+        _validate(
+            tp_size=1,
+            use_v2_model_runner=False,
+            use_mock_nixl=False,
+            block_size_factor=1,
+            max_bytes=512 << 20,
+            slot_count=slot_count,
+        )
 
 
 @pytest.mark.parametrize(
@@ -123,6 +127,12 @@ def test_host_bounce_rejects_unsupported_contract(
             block_size_factor=block_size_factor,
             max_bytes=max_bytes,
         )
+
+
+@pytest.mark.parametrize("slot_count", [0, 3])
+def test_host_bounce_rejects_unsupported_slot_count(slot_count: int) -> None:
+    with pytest.raises(ValueError, match="host_bounce_slot_count must be 1 or 2"):
+        _validate(slot_count=slot_count)
 
 
 def _fresh_registry() -> SourceG2DescriptorRegistry:

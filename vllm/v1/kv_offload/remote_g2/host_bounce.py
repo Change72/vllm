@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Two-slot host-bounce transport for same-node Remote-G2 reads.
+"""Configurable host-bounce transport for Remote-G2 reads.
 
 The direct Remote-G2 path asks UCX to READ remote host memory straight into
 VRAM.  On systems without a native host-to-device RMA lane, UCX emulates that
@@ -9,9 +9,10 @@ READs one bounded chunk into NIXL-registered local DRAM and scatters it to the
 requested GPU blocks with vLLM's existing batched CUDA copy primitive.
 
 ``RemoteG2HostBounceTransport`` deliberately keeps the connector's synchronous
-``submit_load`` contract: it pipelines chunks *within* one job, then drains all
-CUDA events before returning.  Consequently a successful return means the KV
-bytes are already visible to the later model forward pass.
+``submit_load`` contract.  Two slots pipeline chunks *within* one job; one slot
+waits for each H2D before starting the next READ and provides a strict serial
+counterfactual.  Both modes drain all CUDA events before returning, so a
+successful return means the KV bytes are visible to the later model forward.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 
 
 HOST_BOUNCE_SLOT_COUNT = 2
+HOST_BOUNCE_SUPPORTED_SLOT_COUNTS = frozenset({1, HOST_BOUNCE_SLOT_COUNT})
 
 
 @dataclass(frozen=True)
@@ -95,7 +97,7 @@ class _CudaBounceSlot:
 
 
 class CudaHostBounceCopyEngine:
-    """Own two ordinary host buffers and scatter them to GPU KV blocks.
+    """Own one or two ordinary host buffers and scatter to GPU KV blocks.
 
     The payload tensors are intentionally *not* allocated with
     ``pin_memory=True``.  The target NIXL agent is the sole owner of their host
@@ -112,9 +114,9 @@ class CudaHostBounceCopyEngine:
         blocks_per_slot: int,
         slot_count: int = HOST_BOUNCE_SLOT_COUNT,
     ) -> None:
-        if slot_count != HOST_BOUNCE_SLOT_COUNT:
+        if slot_count not in HOST_BOUNCE_SUPPORTED_SLOT_COUNTS:
             raise ValueError(
-                f"host-bounce currently requires exactly {HOST_BOUNCE_SLOT_COUNT} slots"
+                "host-bounce slot_count must be one (serial) or two (double-buffered)"
             )
         if page_size_bytes <= 0:
             raise ValueError("page_size_bytes must be positive")
@@ -347,9 +349,9 @@ class RemoteG2HostBounceTransport:
         blocks_per_slot: int,
         slot_count: int = HOST_BOUNCE_SLOT_COUNT,
     ) -> None:
-        if slot_count != HOST_BOUNCE_SLOT_COUNT:
+        if slot_count not in HOST_BOUNCE_SUPPORTED_SLOT_COUNTS:
             raise ValueError(
-                f"host-bounce currently requires exactly {HOST_BOUNCE_SLOT_COUNT} slots"
+                "host-bounce slot_count must be one (serial) or two (double-buffered)"
             )
         if page_size_bytes <= 0 or blocks_per_slot <= 0:
             raise ValueError("host-bounce page and chunk sizes must be positive")

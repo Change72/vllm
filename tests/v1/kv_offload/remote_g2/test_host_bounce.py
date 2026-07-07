@@ -331,6 +331,7 @@ def _transport(
     *,
     adapter: _FakeAdapter | None = None,
     copy_engine: _FakeCopyEngine | None = None,
+    slot_count: int = 2,
 ) -> tuple[
     RemoteG2HostBounceTransport,
     _FakeAdapter,
@@ -353,6 +354,7 @@ def _transport(
             copy_engine=copy_engine,
             page_size_bytes=PAGE_SIZE,
             blocks_per_slot=BLOCKS_PER_SLOT,
+            slot_count=slot_count,
         ),
         adapter,
         copy_engine,
@@ -408,6 +410,22 @@ def test_chunks_slots_and_partial_tail(
         tail_read = events.index("read:2")
         tail_enqueue = events.index("enqueue:0:2")
         assert second_enqueue < reuse_wait < tail_read < tail_enqueue
+
+
+def test_single_slot_serializes_each_read_after_previous_h2d() -> None:
+    transport, adapter, copy, events = _transport(slot_count=1)
+
+    stats = _run_transfer(transport, 129)
+
+    assert stats.chunk_count == 3
+    assert copy.wait_calls == [0, 0, 0]
+    assert [call["slot"] for call in copy.enqueue_calls] == [0, 0, 0]
+    assert [call["local_byte_offsets"][0] for call in adapter.read_calls] == [0, 0, 0]
+    for chunk in (1, 2):
+        previous_enqueue = events.index(f"enqueue:0:{chunk - 1}")
+        reuse_wait = events.index("wait:0", previous_enqueue)
+        next_read = events.index(f"read:{chunk}")
+        assert previous_enqueue < reuse_wait < next_read
 
 
 def test_transfer_stats_include_stage_times(
