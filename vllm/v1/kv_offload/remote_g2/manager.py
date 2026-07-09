@@ -259,6 +259,35 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
                 req_context.req_id,
             )
             return None
+        has_lease = isinstance(result.lease_id, str) and bool(result.lease_id)
+        has_descriptors = bool(result.descriptors)
+        resolved_shape = has_lease and has_descriptors and result.reason == "ok"
+        empty_shape = (
+            result.lease_id is None
+            and not has_descriptors
+            and isinstance(result.reason, str)
+            and bool(result.reason)
+            and result.reason != "ok"
+        )
+        if not (resolved_shape or empty_shape):
+            logger.error(
+                "RemoteG2: invalid resolve result for req %s: "
+                "lease=%r descriptors=%d reason=%r",
+                req_context.req_id,
+                result.lease_id,
+                len(result.descriptors),
+                result.reason,
+            )
+            if has_lease:
+                try:
+                    client.release_lease(
+                        result.lease_id, reason="invalid_resolve_result"
+                    )
+                except Exception:
+                    logger.exception(
+                        "RemoteG2: invalid resolve result lease cleanup failed"
+                    )
+            return None
         entry = _ResolveCacheEntry(
             plan=plan,
             result=result,
@@ -266,7 +295,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
             client=client,
         )
         self._resolve_cache[req_context.req_id] = entry
-        if result.lease_id is not None and result.descriptors:
+        if resolved_shape:
             self.registry.plan_resolved_count += 1
             logger.debug(
                 "RemoteG2: req %s plan %s resolved: %d descriptors, "
@@ -278,6 +307,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
                 result.reason,
             )
         else:
+            self.registry.record_empty_resolve(result.reason)
             logger.debug(
                 "RemoteG2: req %s plan %s resolve returned no descriptors (reason=%s)",
                 req_context.req_id,
@@ -386,6 +416,7 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         # data_model.py). Summed from descriptor byte_length == the exact
         # amount the transfer handler moves per block.
         entry.bytes_emitted += sum(int(h.byte_length) for h in handles)
+        entry.load_spec_emitted = True
         self._prepared_load_source_by_req[req_id] = "remote"
         logger.debug(
             "RemoteG2: req %s prepare_load -> RemoteG2LoadSpec "
@@ -505,17 +536,43 @@ class RemoteG2OffloadingManager(CPUOffloadingManager):
         if entry is not None:
             self._release_entry(entry, reason=reason)
 
-    @staticmethod
-    def _release_entry(entry: _ResolveCacheEntry, *, reason: str) -> None:
+    def _release_entry(self, entry: _ResolveCacheEntry, *, reason: str) -> None:
         if entry.result.lease_id is not None:
             try:
-                entry.client.release_lease(entry.result.lease_id, reason=reason)
-            except Exception:
-                logger.warning(
-                    "RemoteG2: release_lease cleanup failed; "
-                    "source-side cleanup is still required for lease %s",
-                    entry.result.lease_id,
+                released = entry.client.release_lease(
+                    entry.result.lease_id, reason=reason
                 )
+            except Exception:
+                if entry.load_spec_emitted:
+                    logger.debug(
+                        "RemoteG2: idempotent post-load lease cleanup raised "
+                        "for lease %s",
+                        entry.result.lease_id,
+                        exc_info=True,
+                    )
+                else:
+                    logger.warning(
+                        "RemoteG2: release_lease cleanup failed; "
+                        "source-side cleanup is still required for lease %s",
+                        entry.result.lease_id,
+                    )
+                return
+            if not released:
+                if entry.load_spec_emitted:
+                    logger.debug(
+                        "RemoteG2: idempotent post-load lease cleanup was "
+                        "already satisfied for lease %s",
+                        entry.result.lease_id,
+                    )
+                else:
+                    logger.warning(
+                        "RemoteG2: release_lease rejected for lease %s (reason=%s)",
+                        entry.result.lease_id,
+                        reason,
+                    )
+                return
+            if not entry.load_spec_emitted:
+                self.registry.record_resolved_unemitted(reason)
 
     def take_events(self) -> Iterable[OffloadingEvent]:
         with self._rlock:
@@ -613,3 +670,7 @@ class _ResolveCacheEntry:
     # into the registry's post-completion counters by ``complete_load`` and
     # then zeroed, so re-fired completions never double-count.
     bytes_emitted: int = 0
+    # Distinguish a valid lease that lost to local G2 / was unused from one
+    # whose transfer was emitted and later consumed.  ``bytes_emitted`` is
+    # zeroed after completion, so it cannot serve as this lifetime marker.
+    load_spec_emitted: bool = False
