@@ -248,7 +248,7 @@ class SourceG2RpcServer:
         sample_limit = int(payload.get("sample_limit", 5))
         with self._registry._lock:
             records = list(self._registry._records.items())
-            target_stats: dict[str, int] = {}
+            target_stats: dict[str, Any] = {}
             for attr in (
                 "plan_seen_count",
                 "plan_resolved_count",
@@ -261,6 +261,14 @@ class SourceG2RpcServer:
                 "host_bounce_failures",
             ):
                 target_stats[attr] = int(getattr(self._registry, attr, 0))
+            for attr in (
+                "plan_empty_resolves_by_reason",
+                "plan_resolved_unemitted_by_reason",
+            ):
+                target_stats[attr] = {
+                    str(reason): int(count)
+                    for reason, count in getattr(self._registry, attr, {}).items()
+                }
             result = {
                 "descriptor_count": len(records),
                 "lease_count": len(self._registry._leases),

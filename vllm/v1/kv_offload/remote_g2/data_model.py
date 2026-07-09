@@ -308,6 +308,14 @@ class SourceG2DescriptorRegistry:
         # SourceG2RpcServer.stats so tests can verify cross-engine flow.
         self.plan_seen_count: int = 0
         self.plan_resolved_count: int = 0
+        # Natural serving treats Router plans as advisory hints.  A source
+        # block can be evicted between Router selection and target resolve,
+        # and a target can resolve a lease before a newer local-G2 lookup wins.
+        # Keep both outcomes explicitly classified so perf gates can enforce
+        # exact funnel closure without mistaking normal cache races for
+        # transport failures (or silently hiding real RPC gaps).
+        self.plan_empty_resolves_by_reason: dict[str, int] = {}
+        self.plan_resolved_unemitted_by_reason: dict[str, int] = {}
         self.plan_load_specs_emitted: int = 0
         self.plan_blocks_loaded: int = 0
         # Post-completion counters (incremented in ``complete_load`` ONLY
@@ -473,6 +481,24 @@ class SourceG2DescriptorRegistry:
                 self.host_bounce_bytes_completed += int(num_bytes)
             else:
                 self.host_bounce_failures += 1
+
+    def record_empty_resolve(self, reason: str) -> None:
+        """Classify one successful resolve RPC that returned no lease."""
+
+        key = str(reason or "empty")
+        with self._lock:
+            self.plan_empty_resolves_by_reason[key] = (
+                self.plan_empty_resolves_by_reason.get(key, 0) + 1
+            )
+
+    def record_resolved_unemitted(self, reason: str) -> None:
+        """Classify one valid lease released before a load spec was emitted."""
+
+        key = str(reason or "unknown")
+        with self._lock:
+            self.plan_resolved_unemitted_by_reason[key] = (
+                self.plan_resolved_unemitted_by_reason.get(key, 0) + 1
+            )
 
     def record_completed_load(self, bytes_emitted: int, source_worker_id: int) -> bool:
         """Count one completed plan-driven load. Returns whether it counted.

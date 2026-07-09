@@ -111,11 +111,20 @@ def _store(
 @dataclass
 class _FakeTargetClient:
     descriptors: tuple[RemoteG2Descriptor, ...]
+    empty_reason: str | None = None
     resolve_calls: int = 0
     releases: int = 0
+    release_result: bool = True
 
     def resolve_and_lease(self, plan: RemoteKvReusePlan) -> RemoteG2ResolveResult:
         self.resolve_calls += 1
+        if self.empty_reason is not None:
+            return RemoteG2ResolveResult(
+                lease_id=None,
+                descriptors=(),
+                num_tokens=0,
+                reason=self.empty_reason,
+            )
         return RemoteG2ResolveResult(
             lease_id=f"lease-{plan.request_id}-{self.resolve_calls}",
             descriptors=self.descriptors,
@@ -124,7 +133,7 @@ class _FakeTargetClient:
 
     def release_lease(self, lease_id: str, reason: str = "ack") -> bool:
         self.releases += 1
-        return True
+        return self.release_result
 
 
 def _descriptor(key: OffloadKey, block_id: int = 0) -> RemoteG2Descriptor:
@@ -201,6 +210,9 @@ def test_cached_remote_lease_does_not_override_later_local_selection() -> None:
     assert manager.lookup(local_key, context) is LookupResult.HIT
     assert client.releases == 1
     assert context.req_id not in manager._resolve_cache
+    assert manager.registry.plan_resolved_unemitted_by_reason == {
+        "local_selected": 1
+    }
 
     spec = manager.prepare_load([local_key], context)
     assert isinstance(spec, CPULoadStoreSpec)
@@ -223,6 +235,140 @@ def test_unselected_remote_resolve_is_released_at_schedule_end() -> None:
     manager.on_schedule_end()
     assert context.req_id not in manager._resolve_cache
     assert client.releases == 1
+    assert manager.registry.plan_resolved_unemitted_by_reason == {
+        "unused_resolve": 1
+    }
+    manager.on_schedule_end()
+    manager.on_request_finished(context)
+    assert client.releases == 1
+    assert manager.registry.plan_resolved_unemitted_by_reason == {
+        "unused_resolve": 1
+    }
+
+
+def test_rejected_unemitted_release_is_not_classified_as_benign() -> None:
+    manager = _manager()
+    planned_key, first_miss = _key(20), _key(30)
+    plan = _plan("rejected-release", [_hash(planned_key)])
+    context = _ctx("rejected-release", plan)
+    client = _FakeTargetClient(
+        (_descriptor(planned_key),), release_result=False
+    )
+    manager.set_target_client_factory(lambda _: client)
+
+    assert manager.lookup(first_miss, context) is LookupResult.MISS
+    manager.on_schedule_end()
+    assert client.releases == 1
+    assert manager.registry.plan_resolved_unemitted_by_reason == {}
+
+
+def test_failed_unemitted_release_is_not_classified_as_benign() -> None:
+    manager = _manager()
+    planned_key, first_miss = _key(20), _key(30)
+    plan = _plan("failed-release", [_hash(planned_key)])
+    context = _ctx("failed-release", plan)
+
+    class _FailingReleaseClient(_FakeTargetClient):
+        def release_lease(self, lease_id: str, reason: str = "ack") -> bool:
+            self.releases += 1
+            raise RuntimeError("injected release failure")
+
+    client = _FailingReleaseClient((_descriptor(planned_key),))
+    manager.set_target_client_factory(lambda _: client)
+    assert manager.lookup(first_miss, context) is LookupResult.MISS
+    manager.on_schedule_end()
+    assert client.releases == 1
+    assert manager.registry.plan_resolved_unemitted_by_reason == {}
+
+
+@pytest.mark.parametrize(
+    ("lease_id", "descriptors", "reason"),
+    [
+        ("lease-bad", (), "ok"),
+        (None, (_descriptor(_key(20)),), "ok"),
+        ("lease-bad", (_descriptor(_key(20)),), "missing"),
+        (None, (), "ok"),
+    ],
+)
+def test_inconsistent_resolve_result_fails_closed(
+    lease_id: str | None,
+    descriptors: tuple[RemoteG2Descriptor, ...],
+    reason: str,
+) -> None:
+    manager = _manager()
+    key = _key(20)
+    plan = _plan("bad-result", [_hash(key)])
+    context = _ctx("bad-result", plan)
+
+    class _BadClient(_FakeTargetClient):
+        def resolve_and_lease(
+            self, plan: RemoteKvReusePlan
+        ) -> RemoteG2ResolveResult:
+            self.resolve_calls += 1
+            return RemoteG2ResolveResult(
+                lease_id=lease_id,
+                descriptors=descriptors,
+                num_tokens=len(descriptors) * 16,
+                reason=reason,
+            )
+
+    client = _BadClient(())
+    manager.set_target_client_factory(lambda _: client)
+    assert manager.lookup(key, context) is LookupResult.MISS
+    assert manager.registry.plan_seen_count == 1
+    assert manager.registry.plan_resolved_count == 0
+    assert manager.registry.plan_empty_resolves_by_reason == {}
+    if lease_id is not None:
+        assert client.releases == 1
+
+
+@pytest.mark.parametrize("reason", ["missing", "non_live"])
+def test_empty_resolve_reason_is_classified(reason: str) -> None:
+    manager = _manager()
+    key = _key(20)
+    plan = _plan(f"empty-{reason}", [_hash(key)])
+    context = _ctx(f"empty-{reason}", plan)
+    client = _FakeTargetClient((), empty_reason=reason)
+    manager.set_target_client_factory(lambda _: client)
+
+    assert manager.lookup(key, context) is LookupResult.MISS
+    assert manager.registry.plan_seen_count == 1
+    assert manager.registry.plan_resolved_count == 0
+    assert manager.registry.plan_empty_resolves_by_reason == {reason: 1}
+
+
+def test_emitted_resolve_is_not_counted_as_unemitted() -> None:
+    manager = _manager()
+    key = _key(20)
+    plan = _plan("emitted", [_hash(key)])
+    context = _ctx("emitted", plan)
+    client = _FakeTargetClient((_descriptor(key),))
+    manager.set_target_client_factory(lambda _: client)
+
+    assert manager.lookup(key, context) is LookupResult.HIT
+    spec = manager.prepare_load([key], context)
+    assert isinstance(spec, RemoteG2LoadSpec)
+    assert spec.lease_id is not None
+    client.release_lease(spec.lease_id, reason="load_done")
+    manager.complete_load([key], context)
+    manager.on_request_finished(context)
+    assert manager.registry.plan_resolved_unemitted_by_reason == {}
+
+
+def test_emitted_idempotent_release_rejection_is_not_unemitted() -> None:
+    manager = _manager()
+    key = _key(20)
+    plan = _plan("emitted-release-retry", [_hash(key)])
+    context = _ctx("emitted-release-retry", plan)
+    client = _FakeTargetClient((_descriptor(key),), release_result=False)
+    manager.set_target_client_factory(lambda _: client)
+
+    assert manager.lookup(key, context) is LookupResult.HIT
+    manager.prepare_load([key], context)
+    manager.complete_load([key], context)
+    manager.on_request_finished(context)
+    assert client.releases == 1
+    assert manager.registry.plan_resolved_unemitted_by_reason == {}
 
 
 def test_remote_prepare_fails_closed_if_batch_crosses_source_boundary() -> None:

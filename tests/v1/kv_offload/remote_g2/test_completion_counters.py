@@ -141,12 +141,33 @@ def test_stats_surface_all_gate_fields() -> None:
         "plan_bytes_completed",
     ):
         assert key in ts and isinstance(ts[key], int)
+    assert ts["plan_empty_resolves_by_reason"] == {}
+    assert ts["plan_resolved_unemitted_by_reason"] == {}
     assert res["transport_backend"] == "UCX"
     assert res["transport_mock"] is False
     assert isinstance(res["num_layers"], int)
     assert isinstance(res["boot_id"], str) and res["boot_id"]
     assert res["completed_loads_by_source"] == {}
     assert res["completed_bytes_by_source"] == {}
+
+
+def test_stats_surface_natural_serving_funnel_reasons() -> None:
+    reg = _fresh_registry()
+    reg.record_empty_resolve("missing")
+    reg.record_empty_resolve("missing")
+    reg.record_empty_resolve("non_live")
+    reg.record_resolved_unemitted("local_selected")
+    reg.record_resolved_unemitted("unused_resolve")
+
+    target = _stats(reg)["target_stats"]
+    assert target["plan_empty_resolves_by_reason"] == {
+        "missing": 2,
+        "non_live": 1,
+    }
+    assert target["plan_resolved_unemitted_by_reason"] == {
+        "local_selected": 1,
+        "unused_resolve": 1,
+    }
 
 
 def test_set_transport_info_mock_is_visible() -> None:
